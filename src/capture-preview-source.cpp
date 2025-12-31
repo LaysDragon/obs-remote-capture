@@ -43,11 +43,10 @@ struct FrameData {
 // ========== 來源數據結構 ==========
 struct capture_preview_data {
     obs_source_t* source;           // 此來源本身
-    obs_source_t* capture_source;   // 內部的 window/game capture
+    obs_source_t* capture_source;   // 內部的 window/game capture (持久化)
     
     // 設定
     int capture_mode;               // 0=Window, 1=Game
-    std::string selected_window;    // 選定的視窗
     int delay_ms;                   // 延遲毫秒數
     
     // 視頻緩衝 (環形隊列)
@@ -65,9 +64,6 @@ struct capture_preview_data {
     // 捕捉線程
     std::atomic<bool> active;
     std::thread capture_thread;
-    
-    // 視窗列表緩存
-    std::vector<std::pair<std::string, std::string>> window_list;
     
     capture_preview_data() :
         source(nullptr),
@@ -97,89 +93,7 @@ static void capture_preview_video_render(void* data, gs_effect_t* effect);
 static uint32_t capture_preview_get_width(void* data);
 static uint32_t capture_preview_get_height(void* data);
 
-// ========== 輔助函數：枚舉視窗 ==========
-static void enumerate_windows(capture_preview_data* data) {
-    data->window_list.clear();
-    
-    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
-        ? "game_capture" : "window_capture";
-    
-    // 創建臨時來源以獲取視窗列表
-    obs_source_t* temp_source = obs_source_create(source_type, "__temp_enum__", nullptr, nullptr);
-    if (!temp_source) {
-        blog(LOG_WARNING, "[Capture Preview] Failed to create temp source for enumeration");
-        return;
-    }
-    
-    obs_properties_t* props = obs_source_properties(temp_source);
-    if (props) {
-        obs_property_t* window_prop = obs_properties_get(props, "window");
-        if (window_prop) {
-            size_t count = obs_property_list_item_count(window_prop);
-            for (size_t i = 0; i < count; i++) {
-                const char* name = obs_property_list_item_name(window_prop, i);
-                const char* value = obs_property_list_item_string(window_prop, i);
-                if (name && value && strlen(value) > 0) {
-                    data->window_list.push_back({name, value});
-                }
-            }
-        }
-        obs_properties_destroy(props);
-    }
-    
-    obs_source_release(temp_source);
-    
-    blog(LOG_INFO, "[Capture Preview] Enumerated %zu windows", data->window_list.size());
-}
-
-// ========== 創建/重建捕捉源 ==========
-static void create_capture_source(capture_preview_data* data) {
-    // 釋放舊的捕捉源
-    if (data->capture_source) {
-        // 先停用舊的源
-        obs_source_dec_active(data->capture_source);
-        obs_source_dec_showing(data->capture_source);
-        obs_source_release(data->capture_source);
-        data->capture_source = nullptr;
-        blog(LOG_INFO, "[Capture Preview] Released old capture source");
-    }
-    
-    if (data->selected_window.empty()) {
-        blog(LOG_INFO, "[Capture Preview] No window selected");
-        return;
-    }
-    
-    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
-        ? "game_capture" : "window_capture";
-    
-    // 創建設定
-    obs_data_t* settings = obs_data_create();
-    obs_data_set_string(settings, "window", data->selected_window.c_str());
-    
-    if (data->capture_mode == CAPTURE_MODE_GAME) {
-        obs_data_set_int(settings, "mode", 1);  // CAPTURE_MODE_WINDOW
-        obs_data_set_bool(settings, "capture_cursor", true);
-    } else {
-        obs_data_set_bool(settings, "cursor", true);
-    }
-    
-    blog(LOG_INFO, "[Capture Preview] Creating capture source: type=%s, window=%s", 
-         source_type, data->selected_window.c_str());
-    
-    // 創建私有來源
-    data->capture_source = obs_source_create_private(source_type, "__capture_preview_internal__", settings);
-    obs_data_release(settings);
-    
-    if (data->capture_source) {
-        // 激活私有源 - 這是關鍵！私有源需要手動激活才會開始捕捉
-        obs_source_inc_showing(data->capture_source);
-        obs_source_inc_active(data->capture_source);
-        
-        blog(LOG_INFO, "[Capture Preview] Created and ACTIVATED capture source successfully");
-    } else {
-        blog(LOG_ERROR, "[Capture Preview] Failed to create capture source");
-    }
-}
+// 舊的 create_capture_source 已被 ensure_capture_source_type 取代
 
 // ========== 捕捉線程函數 ==========
 static void capture_thread_func(capture_preview_data* data) {
@@ -371,34 +285,291 @@ static void capture_preview_destroy(void* data_ptr) {
 }
 
 static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
+    blog(LOG_INFO, "[Capture Preview] Update");
     capture_preview_data* data = (capture_preview_data*)data_ptr;
     
     int new_mode = (int)obs_data_get_int(settings, "capture_mode");
-    const char* new_window = obs_data_get_string(settings, "window");
     int new_delay = (int)obs_data_get_int(settings, "delay_ms");
     
-    bool need_recreate = (new_mode != data->capture_mode) || 
-                         (new_window && data->selected_window != new_window);
+    bool mode_changed = (new_mode != data->capture_mode);
     
     data->capture_mode = new_mode;
-    data->selected_window = new_window ? new_window : "";
     data->delay_ms = new_delay;
     
-    if (need_recreate && data->active.load()) {
-        create_capture_source(data);
+    // 如果子源存在，翻譯設定並傳遞給它
+    if (data->capture_source) {
+        // 創建轉換後的設定（移除 child_ 前綴）
+        obs_data_t* child_settings = obs_data_create();
+        obs_data_item_t* item = obs_data_first(settings);
+        const char* prefix = "child_";
+        const size_t prefix_len = 6;
+        
+        while (item) {
+            const char* key = obs_data_item_get_name(item);
+            
+            // 只處理 child_ 開頭的屬性
+            if (strncmp(key, prefix, prefix_len) == 0) {
+                const char* real_key = key + prefix_len;
+                enum obs_data_type dtype = obs_data_item_gettype(item);
+                
+                switch ((int)dtype) {
+                case OBS_DATA_STRING:
+                    obs_data_set_string(child_settings, real_key, obs_data_item_get_string(item));
+                    break;
+                case OBS_DATA_NUMBER:
+                    if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
+                        obs_data_set_int(child_settings, real_key, obs_data_item_get_int(item));
+                    } else {
+                        obs_data_set_double(child_settings, real_key, obs_data_item_get_double(item));
+                    }
+                    break;
+                case OBS_DATA_BOOLEAN:
+                    obs_data_set_bool(child_settings, real_key, obs_data_item_get_bool(item));
+                    break;
+                default:
+                    break;
+                }
+            }
+            obs_data_item_next(&item);
+        }
+        
+        const char* window = obs_data_get_string(child_settings, "window");
+        blog(LOG_INFO, "[Capture Preview] Update: mode=%d, delay=%d, window=%s", 
+             data->capture_mode, data->delay_ms, window ? window : "(null)");
+        
+        obs_source_update(data->capture_source, child_settings);
+        obs_data_release(child_settings);
     }
 }
 
-// ========== 刷新視窗列表按鈕回調 ==========
-static bool on_refresh_clicked(obs_properties_t* props, obs_property_t* prop, void* data_ptr) {
-    UNUSED_PARAMETER(props);
-    UNUSED_PARAMETER(prop);
+// ========== 從子源克隆單一屬性 (帶前綴) ==========
+#define CHILD_PROP_PREFIX "child_"
+
+static void clone_property(obs_properties_t* dest_props, obs_property_t* src_prop) {
+    const char* orig_name = obs_property_name(src_prop);
+    const char* desc = obs_property_description(src_prop);
+    obs_property_type type = obs_property_get_type(src_prop);
     
-    capture_preview_data* data = (capture_preview_data*)data_ptr;
-    enumerate_windows(data);
+    // 創建帶前綴的屬性名稱
+    std::string prefixed_name = std::string(CHILD_PROP_PREFIX) + orig_name;
+    const char* name = prefixed_name.c_str();
     
-    // 需要重新填充視窗列表
-    return true;
+    obs_property_t* new_prop = nullptr;
+    
+    switch (type) {
+    case OBS_PROPERTY_BOOL:
+        new_prop = obs_properties_add_bool(dest_props, name, desc);
+        break;
+        
+    case OBS_PROPERTY_INT: {
+        int min_val = obs_property_int_min(src_prop);
+        int max_val = obs_property_int_max(src_prop);
+        int step = obs_property_int_step(src_prop);
+        obs_number_type num_type = obs_property_int_type(src_prop);
+        
+        if (num_type == OBS_NUMBER_SLIDER) {
+            new_prop = obs_properties_add_int_slider(dest_props, name, desc, min_val, max_val, step);
+        } else {
+            new_prop = obs_properties_add_int(dest_props, name, desc, min_val, max_val, step);
+        }
+        break;
+    }
+    
+    case OBS_PROPERTY_FLOAT: {
+        double min_val = obs_property_float_min(src_prop);
+        double max_val = obs_property_float_max(src_prop);
+        double step = obs_property_float_step(src_prop);
+        obs_number_type num_type = obs_property_float_type(src_prop);
+        
+        if (num_type == OBS_NUMBER_SLIDER) {
+            new_prop = obs_properties_add_float_slider(dest_props, name, desc, min_val, max_val, step);
+        } else {
+            new_prop = obs_properties_add_float(dest_props, name, desc, min_val, max_val, step);
+        }
+        break;
+    }
+    
+    case OBS_PROPERTY_TEXT: {
+        obs_text_type text_type = obs_property_text_type(src_prop);
+        new_prop = obs_properties_add_text(dest_props, name, desc, text_type);
+        break;
+    }
+    
+    case OBS_PROPERTY_LIST: {
+        obs_combo_type combo_type = obs_property_list_type(src_prop);
+        obs_combo_format format = obs_property_list_format(src_prop);
+        new_prop = obs_properties_add_list(dest_props, name, desc, combo_type, format);
+        
+        // 複製列表選項
+        size_t count = obs_property_list_item_count(src_prop);
+        for (size_t i = 0; i < count; i++) {
+            const char* item_name = obs_property_list_item_name(src_prop, i);
+            
+            if (format == OBS_COMBO_FORMAT_INT) {
+                long long item_val = obs_property_list_item_int(src_prop, i);
+                obs_property_list_add_int(new_prop, item_name, item_val);
+            } else if (format == OBS_COMBO_FORMAT_FLOAT) {
+                double item_val = obs_property_list_item_float(src_prop, i);
+                obs_property_list_add_float(new_prop, item_name, item_val);
+            } else {
+                const char* item_val = obs_property_list_item_string(src_prop, i);
+                obs_property_list_add_string(new_prop, item_name, item_val ? item_val : "");
+            }
+        }
+        break;
+    }
+    
+    case OBS_PROPERTY_PATH: {
+        obs_path_type path_type = obs_property_path_type(src_prop);
+        const char* filter = obs_property_path_filter(src_prop);
+        const char* default_path = obs_property_path_default_path(src_prop);
+        new_prop = obs_properties_add_path(dest_props, name, desc, path_type, filter, default_path);
+        break;
+    }
+    
+    case OBS_PROPERTY_BUTTON:
+        // 按鈕無法有效複製 (回調函數無法複製)，跳過
+        blog(LOG_DEBUG, "[Capture Preview] Skipping button property: %s", orig_name);
+        break;
+        
+    case OBS_PROPERTY_COLOR:
+        new_prop = obs_properties_add_color(dest_props, name, desc);
+        break;
+        
+    case OBS_PROPERTY_COLOR_ALPHA:
+        new_prop = obs_properties_add_color_alpha(dest_props, name, desc);
+        break;
+        
+    default:
+        blog(LOG_DEBUG, "[Capture Preview] Unknown property type %d for: %s", type, orig_name);
+        break;
+    }
+    
+    // 複製可見性並添加回調
+    if (new_prop) {
+        obs_property_set_visible(new_prop, obs_property_visible(src_prop));
+        obs_property_set_enabled(new_prop, obs_property_enabled(src_prop));
+        
+        // 對於列表類型屬性，添加級聯刷新回調
+        if (type == OBS_PROPERTY_LIST) {
+            obs_property_set_modified_callback(new_prop, 
+                [](obs_properties_t* props, obs_property_t* p, obs_data_t* settings) -> bool {
+                    UNUSED_PARAMETER(p);
+                    
+                    capture_preview_data* data = (capture_preview_data*)obs_properties_get_param(props);
+                    if (data && data->capture_source) {
+                        // 創建轉換後的設定（移除 child_ 前綴）
+                        obs_data_t* child_settings = obs_data_create();
+                        obs_data_item_t* item = obs_data_first(settings);
+                        const size_t prefix_len = strlen(CHILD_PROP_PREFIX);
+                        
+                        while (item) {
+                            const char* key = obs_data_item_get_name(item);
+                            
+                            // 只處理 child_ 開頭的屬性
+                            if (strncmp(key, CHILD_PROP_PREFIX, prefix_len) == 0) {
+                                const char* real_key = key + prefix_len;
+                                enum obs_data_type dtype = obs_data_item_gettype(item);
+                                
+                                switch ((int)dtype) {
+                                case OBS_DATA_STRING:
+                                    obs_data_set_string(child_settings, real_key, obs_data_item_get_string(item));
+                                    break;
+                                case OBS_DATA_NUMBER:
+                                    if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
+                                        obs_data_set_int(child_settings, real_key, obs_data_item_get_int(item));
+                                    } else {
+                                        obs_data_set_double(child_settings, real_key, obs_data_item_get_double(item));
+                                    }
+                                    break;
+                                case OBS_DATA_BOOLEAN:
+                                    obs_data_set_bool(child_settings, real_key, obs_data_item_get_bool(item));
+                                    break;
+                                default:
+                                    break;
+                                }
+                            }
+                            obs_data_item_next(&item);
+                        }
+                        
+                        obs_source_update(data->capture_source, child_settings);
+                        obs_data_release(child_settings);
+                    }
+                    
+                    return true;  // 強制刷新屬性面板
+                });
+        }
+    }
+}
+
+// ========== 確保子源存在且類型正確 ==========
+static void ensure_capture_source_type(capture_preview_data* data, int mode) {
+    const char* needed_type = (mode == CAPTURE_MODE_GAME) ? "game_capture" : "window_capture";
+    
+    // 如果已有子源且類型匹配，不需要重建
+    if (data->capture_source) {
+        const char* current_type = obs_source_get_id(data->capture_source);
+        if (strcmp(current_type, needed_type) == 0) {
+            return;  // 類型相同，不需要重建
+        }
+        
+        // 類型不同，需要銷毀舊的
+        blog(LOG_INFO, "[Capture Preview] Changing source type from %s to %s", current_type, needed_type);
+        obs_source_dec_active(data->capture_source);
+        obs_source_dec_showing(data->capture_source);
+        obs_source_release(data->capture_source);
+        data->capture_source = nullptr;
+    }
+    
+    // 創建新的子源
+    blog(LOG_INFO, "[Capture Preview] Creating persistent child source: %s", needed_type);
+    data->capture_source = obs_source_create_private(needed_type, "__capture_preview_internal__", nullptr);
+    
+    if (data->capture_source) {
+        // 激活子源
+        obs_source_inc_showing(data->capture_source);
+        obs_source_inc_active(data->capture_source);
+        blog(LOG_INFO, "[Capture Preview] Created and activated child source: %s", needed_type);
+    } else {
+        blog(LOG_ERROR, "[Capture Preview] Failed to create child source: %s", needed_type);
+    }
+}
+
+// ========== 從持久化子源克隆屬性 ==========
+static void clone_properties_from_child(obs_properties_t* dest_props, capture_preview_data* data) {
+    if (!data->capture_source) {
+        blog(LOG_WARNING, "[Capture Preview] No child source for property cloning");
+        return;
+    }
+    
+    obs_properties_t* src_props = obs_source_properties(data->capture_source);
+    if (!src_props) {
+        blog(LOG_WARNING, "[Capture Preview] Failed to get properties from child source");
+        return;
+    }
+    
+    // 遍歷所有屬性並克隆
+    obs_property_t* prop = obs_properties_first(src_props);
+    int prop_count = 0;
+    while (prop) {
+        clone_property(dest_props, prop);
+        prop_count++;
+        obs_property_next(&prop);
+    }
+    
+    blog(LOG_INFO, "[Capture Preview] Cloned %d properties from child source", prop_count);
+    
+    obs_properties_destroy(src_props);
+}
+
+// ========== 延遲更新屬性的回調函數 ==========
+static void deferred_update_properties(void* param) {
+    obs_source_t* source = (obs_source_t*)param;
+    if (source) {
+        blog(LOG_INFO, "[Capture Preview] Deferred obs_source_update_properties called");
+        obs_source_update_properties(source);
+        // obs_source_release(source);  // 釋放我們增加的引用
+    }
 }
 
 // ========== 模式切換回調 ==========
@@ -406,42 +577,75 @@ static bool on_mode_changed(obs_properties_t* props, obs_property_t* prop, obs_d
     UNUSED_PARAMETER(prop);
     
     capture_preview_data* data = (capture_preview_data*)obs_properties_get_param(props);
-    if (data) {
-        data->capture_mode = (int)obs_data_get_int(settings, "capture_mode");
-        enumerate_windows(data);
-    }
+    if (!data) return false;
     
-    return true;
+    int new_mode = (int)obs_data_get_int(settings, "capture_mode");
+    int old_mode = data->capture_mode;
+    
+    // 只有模式真正改變時才重建
+    if (new_mode != old_mode) {
+        data->capture_mode = new_mode;
+        
+        // 確保子源類型正確
+        ensure_capture_source_type(data, new_mode);
+        
+        blog(LOG_INFO, "[Capture Preview] Mode changed from %d to %d (%s)", 
+             old_mode, new_mode,
+             (new_mode == CAPTURE_MODE_GAME) ? "game_capture" : "window_capture");
+        
+        // 使用 obs_queue_task 延遲到 UI 執行緒的下一個事件循環
+        // 避免在 modified_callback 處理期間直接調用 obs_source_update_properties 導致崩潰
+        if (data->source) {
+            obs_queue_task(OBS_TASK_UI, deferred_update_properties, data->source, false);
+            // obs_source_t* ref = obs_source_get_ref(data->source);  // 增加引用避免被銷毀
+            // if (ref) {
+            //     obs_queue_task(OBS_TASK_UI, deferred_update_properties, ref, false);
+            // }
+        }
+        
+        return false;  // 返回 false，讓 OBS 不要在這裡刷新（我們會延遲刷新）
+    }
+    return false;
 }
 
 static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
+    blog(LOG_INFO, "[Capture Preview] Getting properties");
     capture_preview_data* data = (capture_preview_data*)data_ptr;
+    
+    // 確保子源存在
+    ensure_capture_source_type(data, data->capture_mode);
     
     obs_properties_t* props = obs_properties_create();
     obs_properties_set_param(props, data, nullptr);
     
-    // 捕捉模式
+    // ===== 延遲設定 (放在最上面) =====
+    obs_properties_add_int_slider(props, "delay_ms", "Preview Delay (ms)", 0, 5000, 100);
+    
+    // ===== 捕捉模式選擇 =====
     obs_property_t* mode_prop = obs_properties_add_list(props, "capture_mode", "Capture Mode",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(mode_prop, "Window Capture", CAPTURE_MODE_WINDOW);
     obs_property_list_add_int(mode_prop, "Game Capture", CAPTURE_MODE_GAME);
     obs_property_set_modified_callback(mode_prop, on_mode_changed);
     
-    // 視窗選擇
-    obs_property_t* window_prop = obs_properties_add_list(props, "window", "Window",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    // ===== 分隔線/標題 =====
+    obs_properties_add_text(props, "child_props_label", 
+        "--- Capture Source Settings ---", OBS_TEXT_INFO);
     
-    // 枚舉視窗
-    enumerate_windows(data);
-    for (const auto& win : data->window_list) {
-        obs_property_list_add_string(window_prop, win.first.c_str(), win.second.c_str());
-    }
+    // ===== 測試：條件式屬性 (名稱不同) =====
+    // if (data->capture_mode == CAPTURE_MODE_WINDOW) {
+    //     // Window 模式專用屬性
+    //     obs_properties_add_bool(props, "test_window_prop", "Test Window Property");
+    //     // obs_properties_add_int(props, "test_window_int", "Window Int Value", 0, 100, 1);
+    // } 
+    // else {
+    //     // Game 模式專用屬性
+    //     obs_properties_add_bool(props, "test_game_prop", "Test Game Property");
+    //     obs_properties_add_int(props, "test_game_int", "Game Int Value", 0, 100, 1);
+    // }
     
-    // 刷新按鈕
-    obs_properties_add_button(props, "refresh", "Refresh Window List", on_refresh_clicked);
-    
-    // 延遲設定
-    obs_properties_add_int_slider(props, "delay_ms", "Delay (ms)", 0, 5000, 100);
+    // ===== 從持久化子源克隆屬性 (暫時註解) =====
+    // clone_properties_from_child(props, data);
     
     return props;
 }
@@ -458,7 +662,8 @@ static void capture_preview_activate(void* data_ptr) {
     
     blog(LOG_INFO, "[Capture Preview] Activating...");
     
-    create_capture_source(data);
+    // 確保子源存在（如果還沒創建的話）
+    ensure_capture_source_type(data, data->capture_mode);
     
     data->active.store(true);
     data->capture_thread = std::thread(capture_thread_func, data);
