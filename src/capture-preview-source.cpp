@@ -106,6 +106,8 @@ static void capture_thread_func(capture_preview_data* data) {
     uint32_t success_count = 0;
     
     while (data->active.load()) {
+        // os_sleep_ms(100);
+        //     continue;
         if (!data->capture_source) {
             no_source_count++;
             if (no_source_count == 1 || no_source_count % 30 == 0) {
@@ -284,6 +286,69 @@ static void capture_preview_destroy(void* data_ptr) {
     blog(LOG_INFO, "[Capture Preview] Source destroyed");
 }
 
+// ========== 從 settings 提取 child_ 開頭的設定 ==========
+// 返回的 obs_data_t 需要由調用者釋放
+static obs_data_t* extract_child_settings(obs_data_t* settings) {
+    obs_data_t* child_settings = obs_data_create();
+    obs_data_item_t* item = obs_data_first(settings);
+    const char* prefix = "child_";
+    const size_t prefix_len = 6;
+    
+    while (item) {
+        const char* key = obs_data_item_get_name(item);
+        
+        // 只處理 child_ 開頭的屬性
+        if (strncmp(key, prefix, prefix_len) == 0) {
+            const char* real_key = key + prefix_len;
+            enum obs_data_type dtype = obs_data_item_gettype(item);
+            
+            switch ((int)dtype) {
+            case OBS_DATA_STRING:
+                obs_data_set_string(child_settings, real_key, obs_data_item_get_string(item));
+                break;
+            case OBS_DATA_NUMBER:
+                if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
+                    obs_data_set_int(child_settings, real_key, obs_data_item_get_int(item));
+                } else {
+                    obs_data_set_double(child_settings, real_key, obs_data_item_get_double(item));
+                }
+                break;
+            case OBS_DATA_BOOLEAN:
+                obs_data_set_bool(child_settings, real_key, obs_data_item_get_bool(item));
+                break;
+            default:
+                break;
+            }
+        }
+        obs_data_item_next(&item);
+    }
+    
+    return child_settings;
+}
+
+// ========== 前向聲明 (clone_properties_from_child 需要) ==========
+static void clone_properties_from_child(obs_properties_t* dest_props, capture_preview_data* data);
+
+// ========== 更新子源並刷新屬性 ==========
+static bool update_child_and_refresh_props(obs_properties_t* props, obs_data_t* settings, capture_preview_data* data) {
+    if (!data || !data->capture_source) return false;
+    // os_sleep_ms(100);
+    blog(LOG_INFO, "[Capture Preview] Update child source and refresh properties");
+    // 提取並應用子源設定
+    obs_data_t* child_settings = extract_child_settings(settings);
+    obs_source_update(data->capture_source, child_settings);
+    // obs_data_release(child_settings);
+    
+    // 短暫延遲，讓子源完成 update 的內部處理
+    // 避免 obs_source_properties 與子源的內部鎖產生衝突
+    // os_sleep_ms(10);
+    
+    // 刷新子源屬性（子源可能因設定變化而更新其可用選項）
+    clone_properties_from_child(props, data);
+    
+    return true;  // 返回 true 刷新 UI
+}
+
 static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     blog(LOG_INFO, "[Capture Preview] Update");
     capture_preview_data* data = (capture_preview_data*)data_ptr;
@@ -291,47 +356,12 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     int new_mode = (int)obs_data_get_int(settings, "capture_mode");
     int new_delay = (int)obs_data_get_int(settings, "delay_ms");
     
-    bool mode_changed = (new_mode != data->capture_mode);
-    
     data->capture_mode = new_mode;
     data->delay_ms = new_delay;
     
     // 如果子源存在，翻譯設定並傳遞給它
     if (data->capture_source) {
-        // 創建轉換後的設定（移除 child_ 前綴）
-        obs_data_t* child_settings = obs_data_create();
-        obs_data_item_t* item = obs_data_first(settings);
-        const char* prefix = "child_";
-        const size_t prefix_len = 6;
-        
-        while (item) {
-            const char* key = obs_data_item_get_name(item);
-            
-            // 只處理 child_ 開頭的屬性
-            if (strncmp(key, prefix, prefix_len) == 0) {
-                const char* real_key = key + prefix_len;
-                enum obs_data_type dtype = obs_data_item_gettype(item);
-                
-                switch ((int)dtype) {
-                case OBS_DATA_STRING:
-                    obs_data_set_string(child_settings, real_key, obs_data_item_get_string(item));
-                    break;
-                case OBS_DATA_NUMBER:
-                    if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
-                        obs_data_set_int(child_settings, real_key, obs_data_item_get_int(item));
-                    } else {
-                        obs_data_set_double(child_settings, real_key, obs_data_item_get_double(item));
-                    }
-                    break;
-                case OBS_DATA_BOOLEAN:
-                    obs_data_set_bool(child_settings, real_key, obs_data_item_get_bool(item));
-                    break;
-                default:
-                    break;
-                }
-            }
-            obs_data_item_next(&item);
-        }
+        obs_data_t* child_settings = extract_child_settings(settings);
         
         const char* window = obs_data_get_string(child_settings, "window");
         blog(LOG_INFO, "[Capture Preview] Update: mode=%d, delay=%d, window=%s", 
@@ -342,6 +372,31 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     }
 }
 
+
+static bool is_data_item_equal(obs_data_t* old_settings,obs_data_t* new_settings,const char * old_item_name,const char * new_item_name){
+    obs_data_item_t* old_item = obs_data_item_byname(old_settings, old_item_name);
+    obs_data_item_t* new_item = obs_data_item_byname(new_settings, new_item_name);
+    enum obs_data_type dtype = obs_data_item_gettype(old_item);
+    enum obs_data_type new_dtype = obs_data_item_gettype(new_item);
+    if(dtype != new_dtype){
+        return false;
+    }
+            
+    switch ((int)dtype) {
+        case OBS_DATA_STRING:       
+            return obs_data_item_get_string(old_item) == obs_data_item_get_string(new_item);
+        case OBS_DATA_NUMBER:
+            if (obs_data_item_numtype(old_item) == OBS_DATA_NUM_INT) {
+                return obs_data_item_get_int(old_item) == obs_data_item_get_int(new_item);
+            } else {
+                return obs_data_item_get_double(old_item) == obs_data_item_get_double(new_item);
+            }
+        case OBS_DATA_BOOLEAN:
+            return obs_data_item_get_bool(old_item) == obs_data_item_get_bool(new_item);
+        default:
+            return true;
+    }
+}
 // ========== 從子源克隆單一屬性 (帶前綴) ==========
 #define CHILD_PROP_PREFIX "child_"
 
@@ -450,55 +505,29 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
         obs_property_set_visible(new_prop, obs_property_visible(src_prop));
         obs_property_set_enabled(new_prop, obs_property_enabled(src_prop));
         
-        // 對於列表類型屬性，添加級聯刷新回調
-        if (type == OBS_PROPERTY_LIST) {
-            obs_property_set_modified_callback(new_prop, 
-                [](obs_properties_t* props, obs_property_t* p, obs_data_t* settings) -> bool {
-                    UNUSED_PARAMETER(p);
-                    
-                    capture_preview_data* data = (capture_preview_data*)obs_properties_get_param(props);
-                    if (data && data->capture_source) {
-                        // 創建轉換後的設定（移除 child_ 前綴）
-                        obs_data_t* child_settings = obs_data_create();
-                        obs_data_item_t* item = obs_data_first(settings);
-                        const size_t prefix_len = strlen(CHILD_PROP_PREFIX);
-                        
-                        while (item) {
-                            const char* key = obs_data_item_get_name(item);
-                            
-                            // 只處理 child_ 開頭的屬性
-                            if (strncmp(key, CHILD_PROP_PREFIX, prefix_len) == 0) {
-                                const char* real_key = key + prefix_len;
-                                enum obs_data_type dtype = obs_data_item_gettype(item);
-                                
-                                switch ((int)dtype) {
-                                case OBS_DATA_STRING:
-                                    obs_data_set_string(child_settings, real_key, obs_data_item_get_string(item));
-                                    break;
-                                case OBS_DATA_NUMBER:
-                                    if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
-                                        obs_data_set_int(child_settings, real_key, obs_data_item_get_int(item));
-                                    } else {
-                                        obs_data_set_double(child_settings, real_key, obs_data_item_get_double(item));
-                                    }
-                                    break;
-                                case OBS_DATA_BOOLEAN:
-                                    obs_data_set_bool(child_settings, real_key, obs_data_item_get_bool(item));
-                                    break;
-                                default:
-                                    break;
-                                }
-                            }
-                            obs_data_item_next(&item);
-                        }
-                        
-                        obs_source_update(data->capture_source, child_settings);
-                        obs_data_release(child_settings);
-                    }
-                    
-                    return true;  // 強制刷新屬性面板
-                });
-        }
+        // 對所有 child 屬性添加級聯刷新回調
+        // 當任何 child 屬性變化時，更新子源並刷新屬性列表
+        obs_property_set_modified_callback(new_prop, 
+            [](obs_properties_t* props, obs_property_t* p, obs_data_t* settings) -> bool {
+                // UNUSED_PARAMETER(p);
+                capture_preview_data* data = (capture_preview_data*)obs_properties_get_param(props);
+                obs_data_t* old_settings = obs_source_get_settings(data->capture_source);
+
+                // 只有模式真正改變時才重建
+                //TODO: 考慮到首次初始化時是否有有效的settings可供比對，為何初始更新就會觸發這個modified，而創建新的好樣就不會
+                //TODO: 另外capture source的settings name mpaaing與上層nameing mapping不一樣，這裡要重新映射才行，要拿掉child_前綴
+                const char* old_prop_name = obs_property_name(p);
+                const char* new_prop_name = obs_property_name(p);
+                const char* real_child_key = old_prop_name + strlen("child_");
+                if(!obs_data_has_user_value(settings, real_child_key)) {
+                    return false;
+                }
+                
+                if (is_data_item_equal(old_settings, settings, real_child_key,new_prop_name)) {
+                    return false;
+                }
+                return update_child_and_refresh_props(props, settings, data);
+            });
     }
 }
 
