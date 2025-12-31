@@ -542,6 +542,23 @@ static void clone_properties_from_child(obs_properties_t* dest_props, capture_pr
         return;
     }
     
+    // ===== 首先移除所有舊的 child_ 屬性 =====
+    std::vector<std::string> props_to_remove;
+    obs_property_t* prop = obs_properties_first(dest_props);
+    while (prop) {
+        const char* name = obs_property_name(prop);
+        if (strncmp(name, CHILD_PROP_PREFIX, strlen(CHILD_PROP_PREFIX)) == 0) {
+            props_to_remove.push_back(name);
+        }
+        obs_property_next(&prop);
+    }
+    
+    for (const auto& name : props_to_remove) {
+        obs_properties_remove_by_name(dest_props, name.c_str());
+    }
+    blog(LOG_INFO, "[Capture Preview] Removed %d old child properties", (int)props_to_remove.size());
+    
+    // ===== 從子源獲取並克隆新屬性 =====
     obs_properties_t* src_props = obs_source_properties(data->capture_source);
     if (!src_props) {
         blog(LOG_WARNING, "[Capture Preview] Failed to get properties from child source");
@@ -549,7 +566,7 @@ static void clone_properties_from_child(obs_properties_t* dest_props, capture_pr
     }
     
     // 遍歷所有屬性並克隆
-    obs_property_t* prop = obs_properties_first(src_props);
+    prop = obs_properties_first(src_props);
     int prop_count = 0;
     while (prop) {
         clone_property(dest_props, prop);
@@ -595,15 +612,28 @@ static bool on_mode_changed(obs_properties_t* props, obs_property_t* prop, obs_d
         
         // 使用 obs_queue_task 延遲到 UI 執行緒的下一個事件循環
         // 避免在 modified_callback 處理期間直接調用 obs_source_update_properties 導致崩潰
-        if (data->source) {
-            obs_queue_task(OBS_TASK_UI, deferred_update_properties, data->source, false);
+        // if (data->source) {
+            // obs_queue_task(OBS_TASK_UI, deferred_update_properties, data->source, false);
             // obs_source_t* ref = obs_source_get_ref(data->source);  // 增加引用避免被銷毀
             // if (ref) {
             //     obs_queue_task(OBS_TASK_UI, deferred_update_properties, ref, false);
             // }
-        }
+        // }
+        clone_properties_from_child(props, data);
         
-        return false;  // 返回 false，讓 OBS 不要在這裡刷新（我們會延遲刷新）
+        // ===== DEBUG: 列出最終的所有屬性 =====
+        blog(LOG_INFO, "[Capture Preview] === Final properties list (on_mode_changed) ===");
+        obs_property_t* debug_prop = obs_properties_first(props);
+        int total_count = 0;
+        while (debug_prop) {
+            const char* prop_name = obs_property_name(debug_prop);
+            blog(LOG_INFO, "[Capture Preview]   [%d] %s", total_count, prop_name);
+            total_count++;
+            obs_property_next(&debug_prop);
+        }
+        blog(LOG_INFO, "[Capture Preview] === Total: %d properties ===", total_count);
+        
+        return true;  // 返回 true，讓 OBS 刷新 UI
     }
     return false;
 }
@@ -636,7 +666,7 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
     // if (data->capture_mode == CAPTURE_MODE_WINDOW) {
     //     // Window 模式專用屬性
     //     obs_properties_add_bool(props, "test_window_prop", "Test Window Property");
-    //     // obs_properties_add_int(props, "test_window_int", "Window Int Value", 0, 100, 1);
+    //     obs_properties_add_int(props, "test_window_int", "Window Int Value", 0, 100, 1);
     // } 
     // else {
     //     // Game 模式專用屬性
@@ -644,8 +674,20 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
     //     obs_properties_add_int(props, "test_game_int", "Game Int Value", 0, 100, 1);
     // }
     
-    // ===== 從持久化子源克隆屬性 (暫時註解) =====
-    // clone_properties_from_child(props, data);
+    // ===== 從持久化子源克隆屬性 =====
+    clone_properties_from_child(props, data);
+    
+    // ===== DEBUG: 列出最終的所有屬性 =====
+    blog(LOG_INFO, "[Capture Preview] === Final properties list (get_properties) ===");
+    obs_property_t* debug_prop = obs_properties_first(props);
+    int total_count = 0;
+    while (debug_prop) {
+        const char* prop_name = obs_property_name(debug_prop);
+        blog(LOG_INFO, "[Capture Preview]   [%d] %s", total_count, prop_name);
+        total_count++;
+        obs_property_next(&debug_prop);
+    }
+    blog(LOG_INFO, "[Capture Preview] === Total: %d properties ===", total_count);
     
     return props;
 }
