@@ -14,9 +14,11 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-remote-window-capture", "en-US")
 
 // 外部聲明 (定義於其他源文件)
 extern struct obs_source_info remote_source_info;
+extern struct obs_source_info capture_preview_info;
 
 // 初始化函數
 extern void init_remote_source_info(void);
+extern void init_capture_preview_info(void);
 
 // 伺服器啟動/停止函數
 extern void remote_server_start(void);
@@ -29,9 +31,13 @@ bool obs_module_load(void)
 
     // 初始化來源信息結構
     init_remote_source_info();
+    init_capture_preview_info();
 
     // 註冊遠端來源 (接收端使用)
     obs_register_source(&remote_source_info);
+    
+    // 註冊本地預覽來源 (驗證用)
+    obs_register_source(&capture_preview_info);
 
     // 啟動遠端伺服器 (發送端使用)
     remote_server_start();

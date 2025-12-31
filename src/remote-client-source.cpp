@@ -68,6 +68,7 @@ struct remote_source_data {
     std::atomic<bool> connected;
     std::atomic<bool> streaming;
     std::thread receive_thread;
+    std::mutex socket_mutex;  // 保護 socket 操作
 
     // 視頻幀緩衝
     std::mutex video_mutex;
@@ -199,8 +200,20 @@ static void disconnect_from_server(remote_source_data* data) {
 }
 
 // ========== 請求屬性列表 ==========
+// forward declaration
+static void stop_streaming(remote_source_data* data);
+
 static bool request_properties(remote_source_data* data) {
+    // 如果正在串流，先停止
+    if (data->streaming.load()) {
+        blog(LOG_INFO, "[Remote Source] Stopping current stream before refreshing properties");
+        stop_streaming(data);
+    }
+    
     if (!connect_to_server(data)) return false;
+
+    // 使用 socket mutex 保護操作
+    std::lock_guard<std::mutex> socket_lock(data->socket_mutex);
 
     // 發送請求
     PacketHeader header;
@@ -208,21 +221,43 @@ static bool request_properties(remote_source_data* data) {
     req.capture_mode = (uint8_t)data->capture_mode;
 
     packet_header_init(&header, MSG_GET_PROPERTIES, sizeof(req));
-    if (!send_all(data->socket, &header, sizeof(header))) return false;
-    if (!send_all(data->socket, &req, sizeof(req))) return false;
+    if (!send_all(data->socket, &header, sizeof(header))) {
+        blog(LOG_WARNING, "[Remote Source] Failed to send properties request header");
+        return false;
+    }
+    if (!send_all(data->socket, &req, sizeof(req))) {
+        blog(LOG_WARNING, "[Remote Source] Failed to send properties request body");
+        return false;
+    }
 
     // 接收回應
-    if (!recv_all(data->socket, &header, sizeof(header))) return false;
-    if (!packet_header_validate(&header)) return false;
-    if (header.type != MSG_PROPERTIES_RESPONSE) return false;
+    if (!recv_all(data->socket, &header, sizeof(header))) {
+        blog(LOG_WARNING, "[Remote Source] Failed to receive properties response header");
+        return false;
+    }
+    if (!packet_header_validate(&header)) {
+        blog(LOG_WARNING, "[Remote Source] Invalid properties response header (magic=0x%08X, version=%d)", 
+             header.magic, header.version);
+        return false;
+    }
+    if (header.type != MSG_PROPERTIES_RESPONSE) {
+        blog(LOG_WARNING, "[Remote Source] Unexpected response type: %d (expected %d)", 
+             header.type, MSG_PROPERTIES_RESPONSE);
+        return false;
+    }
 
     std::vector<char> json_data(header.payload_size + 1);
-    if (!recv_all(data->socket, json_data.data(), header.payload_size)) return false;
+    if (!recv_all(data->socket, json_data.data(), header.payload_size)) {
+        blog(LOG_WARNING, "[Remote Source] Failed to receive properties JSON data");
+        return false;
+    }
     json_data[header.payload_size] = '\0';
 
     // 存儲 JSON
-    std::lock_guard<std::mutex> lock(data->props_mutex);
-    data->cached_properties_json = json_data.data();
+    {
+        std::lock_guard<std::mutex> lock(data->props_mutex);
+        data->cached_properties_json = json_data.data();
+    }
 
     // 輸出原始 JSON 以便調試
     blog(LOG_INFO, "[Remote Source] Received JSON (length=%zu): %.500s...", 
@@ -398,8 +433,13 @@ static void receive_thread_func(remote_source_data* data) {
 
 // ========== 開始串流 ==========
 static void start_streaming(remote_source_data* data) {
-    if (data->streaming.load()) return;
+    if (data->streaming.load()) {
+        blog(LOG_DEBUG, "[Remote Source] Already streaming, ignoring start request");
+        return;
+    }
     if (!connect_to_server(data)) return;
+
+    blog(LOG_INFO, "[Remote Source] Starting stream with window: %s", data->selected_window.c_str());
 
     // 構建設定 JSON
     std::ostringstream json;
@@ -426,11 +466,14 @@ static void start_streaming(remote_source_data* data) {
     }
     json_str += "}";
 
-    // 發送開始串流請求
-    PacketHeader header;
-    packet_header_init(&header, MSG_START_STREAM, (uint32_t)json_str.size());
-    send_all(data->socket, &header, sizeof(header));
-    send_all(data->socket, json_str.data(), json_str.size());
+    // 發送開始串流請求 (需要 socket 保護)
+    {
+        std::lock_guard<std::mutex> lock(data->socket_mutex);
+        PacketHeader header;
+        packet_header_init(&header, MSG_START_STREAM, (uint32_t)json_str.size());
+        send_all(data->socket, &header, sizeof(header));
+        send_all(data->socket, json_str.data(), json_str.size());
+    }
 
     // 啟動接收線程
     data->streaming.store(true);
@@ -440,18 +483,25 @@ static void start_streaming(remote_source_data* data) {
 static void stop_streaming(remote_source_data* data) {
     if (!data->streaming.load()) return;
 
-    // 發送停止請求
+    blog(LOG_INFO, "[Remote Source] Stopping stream");
+
+    // 先標記停止，讓接收線程知道要結束
+    data->streaming.store(false);
+
+    // 發送停止請求 (需要 socket 保護)
     if (data->connected.load() && data->socket != SOCKET_INVALID) {
+        std::lock_guard<std::mutex> lock(data->socket_mutex);
         PacketHeader header;
         packet_header_init(&header, MSG_STOP_STREAM, 0);
         send_all(data->socket, &header, sizeof(header));
     }
 
-    data->streaming.store(false);
-
+    // 等待接收線程結束
     if (data->receive_thread.joinable()) {
         data->receive_thread.join();
     }
+
+    blog(LOG_INFO, "[Remote Source] Stream stopped");
 }
 
 // ========== OBS 來源回調 ==========
