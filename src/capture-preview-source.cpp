@@ -276,6 +276,8 @@ static void capture_preview_destroy(void* data_ptr) {
     if (data->capture_source) {
         // 移除音頻回調
         obs_source_remove_audio_capture_callback(data->capture_source, audio_capture_callback, data);
+        // 移除父子源關係
+        obs_source_remove_active_child(data->source, data->capture_source);
         obs_source_release(data->capture_source);
     }
     
@@ -696,8 +698,9 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
         // 移除音頻回調（如果之前註冊過）
         obs_source_remove_audio_capture_callback(data->capture_source, audio_capture_callback, data);
         
-        obs_source_dec_active(data->capture_source);
-        obs_source_dec_showing(data->capture_source);
+        // 從父源移除子源關係
+        obs_source_remove_active_child(data->source, data->capture_source);
+        
         obs_source_release(data->capture_source);
         data->capture_source = nullptr;
     }
@@ -707,9 +710,8 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
     data->capture_source = obs_source_create_private(source_type, "__capture_preview_internal__", nullptr);
     
     if (data->capture_source) {
-        // 激活子源
-        obs_source_inc_showing(data->capture_source);
-        obs_source_inc_active(data->capture_source);
+        // 建立父子源關係並激活子源
+        obs_source_add_active_child(data->source, data->capture_source);
         
         // 檢查子源是否支持音頻
         uint32_t child_flags = obs_source_get_output_flags(data->capture_source);
@@ -1059,6 +1061,16 @@ static uint32_t capture_preview_get_height(void* data_ptr) {
     return data->output_height;
 }
 
+// ========== 枚舉活動子源回調 ==========
+static void capture_preview_enum_active_sources(void* data_ptr, 
+                                                 obs_source_enum_proc_t enum_callback,
+                                                 void* param) {
+    capture_preview_data* data = (capture_preview_data*)data_ptr;
+    if (data->capture_source) {
+        enum_callback(data->source, data->capture_source, param);
+    }
+}
+
 // ========== 來源信息結構 ==========
 extern "C" {
 
@@ -1083,6 +1095,7 @@ void init_capture_preview_info() {
     capture_preview_info.video_render = capture_preview_video_render;
     capture_preview_info.get_width = capture_preview_get_width;
     capture_preview_info.get_height = capture_preview_get_height;
+    capture_preview_info.enum_active_sources = capture_preview_enum_active_sources;
 }
 
 }  // extern "C"
