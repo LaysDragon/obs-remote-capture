@@ -70,6 +70,11 @@
       "warnings": {
         "dev": true,
         "deprecated": true
+      },
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "C:/DevEnv/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "ENABLE_GRPC": true
       }
     },
     {

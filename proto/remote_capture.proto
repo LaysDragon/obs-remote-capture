@@ -1,0 +1,108 @@
+syntax = "proto3";
+package obsremote;
+
+// 屬性類型
+enum PropertyType {
+  PROPERTY_UNKNOWN = 0;
+  PROPERTY_BOOL = 1;
+  PROPERTY_INT = 2;
+  PROPERTY_FLOAT = 3;
+  PROPERTY_TEXT = 4;
+  PROPERTY_PATH = 5;
+  PROPERTY_LIST = 6;
+}
+
+// 列表項
+message ListItem {
+  string name = 1;
+  string value = 2;
+}
+
+// 屬性定義
+message Property {
+  string name = 1;
+  string description = 2;
+  PropertyType type = 3;
+  bool visible = 4;
+  
+  // LIST 類型
+  repeated ListItem items = 10;
+  string current_string = 11;
+  int64 current_int = 12;
+  
+  // BOOL 類型
+  bool default_bool = 20;
+  
+  // INT 類型
+  int32 min_int = 30;
+  int32 max_int = 31;
+  int32 step_int = 32;
+  int32 default_int = 33;
+  
+  // FLOAT 類型
+  double min_float = 40;
+  double max_float = 41;
+  double step_float = 42;
+  double default_float = 43;
+  
+  // TEXT 類型
+  string default_text = 50;
+}
+
+// 請求獲取屬性
+message GetPropertiesRequest {
+  string source_type = 1;  // "window_capture" or "game_capture"
+}
+
+message GetPropertiesResponse {
+  repeated Property properties = 1;
+}
+
+// 開始串流請求
+message StartStreamRequest {
+  string source_type = 1;
+  map<string, string> settings = 2;
+}
+
+// 視頻幀
+message VideoFrame {
+  uint32 width = 1;
+  uint32 height = 2;
+  bytes jpeg_data = 3;
+  uint64 timestamp_ns = 4;
+  uint32 frame_number = 5;
+}
+
+// 音頻幀
+message AudioFrame {
+  uint32 sample_rate = 1;
+  uint32 channels = 2;
+  bytes pcm_data = 3;  // Float32 interleaved stereo
+  uint64 timestamp_ns = 4;
+}
+
+// 串流幀 (影音二選一)
+message StreamFrame {
+  oneof data {
+    VideoFrame video = 1;
+    AudioFrame audio = 2;
+  }
+}
+
+// 停止串流
+message StopStreamRequest {}
+message StopStreamResponse {
+  bool success = 1;
+}
+
+// 服務定義
+service RemoteCaptureService {
+  // 獲取指定來源類型的屬性列表
+  rpc GetProperties(GetPropertiesRequest) returns (GetPropertiesResponse);
+  
+  // 開始串流 - 服務端推送影音數據
+  rpc StartStream(StartStreamRequest) returns (stream StreamFrame);
+  
+  // 停止串流
+  rpc StopStream(StopStreamRequest) returns (StopStreamResponse);
+}

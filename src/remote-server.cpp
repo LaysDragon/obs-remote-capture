@@ -68,6 +68,9 @@ struct StreamSession {
     uint32_t width;
     uint32_t height;
     
+    // 音頻相關
+    std::mutex audio_mutex;  // 保護 socket 發送的互斥鎖
+
 #ifdef HAVE_TURBOJPEG
     tjhandle jpeg_compressor;
 #endif
@@ -88,6 +91,7 @@ struct StreamSession {
         frame_number(0)
     {}
 };
+
 
 static std::mutex g_sessions_mutex;
 static std::vector<std::unique_ptr<StreamSession>> g_sessions;
@@ -123,6 +127,62 @@ static bool recv_all(socket_t sock, void* data, size_t len) {
 // ========== 獲取當前時間戳 (毫秒) ==========
 static uint32_t get_timestamp_ms() {
     return (uint32_t)(os_gettime_ns() / 1000000ULL);
+}
+
+// ========== 音頻捕獲回調 - 發送音頻封包到客戶端 ==========
+static void audio_capture_callback(void* param, obs_source_t* source,
+                                    const struct audio_data* audio, bool muted) {
+    UNUSED_PARAMETER(source);
+    
+    StreamSession* session = (StreamSession*)param;
+    if (!session || !session->active.load() || muted) return;
+    if (!audio || audio->frames == 0) return;
+    
+    // 計算 PCM 數據大小 (假設立體聲 float32)
+    size_t channels = 2;
+    size_t pcm_size = audio->frames * channels * sizeof(float);
+    
+    // 構建封包頭
+    PacketHeader header;
+    packet_header_init(&header, MSG_AUDIO_FRAME, (uint32_t)(sizeof(AudioFrameHeader) + pcm_size));
+    header.timestamp_ms = get_timestamp_ms();
+    
+    AudioFrameHeader audio_header;
+    audio_header.sample_rate = 48000;  // 假設 48kHz
+    audio_header.channels = (uint32_t)channels;
+    audio_header.format = 0;  // Float32
+    audio_header.samples = audio->frames;
+    
+    // 線程安全發送
+    {
+        std::lock_guard<std::mutex> lock(session->audio_mutex);
+        
+        if (!send_all(session->client_socket, &header, sizeof(header))) {
+            blog(LOG_DEBUG, "[Remote Server] Failed to send audio header");
+            return;
+        }
+        
+        if (!send_all(session->client_socket, &audio_header, sizeof(audio_header))) {
+            blog(LOG_DEBUG, "[Remote Server] Failed to send audio frame header");
+            return;
+        }
+        
+        // 發送 PCM 數據 (交錯立體聲)
+        // OBS 音頻是平面格式，需要交錯
+        std::vector<float> interleaved(audio->frames * channels);
+        const float* left = (const float*)audio->data[0];
+        const float* right = audio->data[1] ? (const float*)audio->data[1] : left;
+        
+        for (uint32_t i = 0; i < audio->frames; i++) {
+            interleaved[i * 2] = left[i];
+            interleaved[i * 2 + 1] = right[i];
+        }
+        
+        if (!send_all(session->client_socket, interleaved.data(), pcm_size)) {
+            blog(LOG_DEBUG, "[Remote Server] Failed to send audio PCM data");
+            return;
+        }
+    }
 }
 
 // ========== 轉義 JSON 字符串 ==========
@@ -371,9 +431,13 @@ static void capture_and_send_frame(StreamSession* session) {
                 video_header.format = 1;  // JPEG
                 video_header.frame_number = session->frame_number++;
                 
-                send_all(session->client_socket, &header, sizeof(header));
-                send_all(session->client_socket, &video_header, sizeof(video_header));
-                send_all(session->client_socket, jpeg_buf, jpeg_size);
+                // 線程安全發送 (與音頻回調共享 socket)
+                {
+                    std::lock_guard<std::mutex> lock(session->audio_mutex);
+                    send_all(session->client_socket, &header, sizeof(header));
+                    send_all(session->client_socket, &video_header, sizeof(video_header));
+                    send_all(session->client_socket, jpeg_buf, jpeg_size);
+                }
                 
                 tjFree(jpeg_buf);
             }
@@ -482,7 +546,15 @@ static void handle_client(socket_t client_socket) {
                     source_type, "__remote_capture__", settings);
 
                 if (session->capture_source) {
-                    blog(LOG_INFO, "[Remote Server] Started streaming: %s", source_type);
+                    // 激活子源
+                    obs_source_inc_showing(session->capture_source);
+                    obs_source_inc_active(session->capture_source);
+                    
+                    // 註冊音頻捕獲回調
+                    obs_source_add_audio_capture_callback(
+                        session->capture_source, audio_capture_callback, session.get());
+                    
+                    blog(LOG_INFO, "[Remote Server] Started streaming with audio: %s", source_type);
                     
                     // 啟動串流線程
                     session->stream_thread = std::thread(stream_thread_func, session.get());
@@ -502,6 +574,12 @@ static void handle_client(socket_t client_socket) {
             }
             
             if (session->capture_source) {
+                // 移除音頻回調
+                obs_source_remove_audio_capture_callback(
+                    session->capture_source, audio_capture_callback, session.get());
+                // 停用子源
+                obs_source_dec_active(session->capture_source);
+                obs_source_dec_showing(session->capture_source);
                 obs_source_release(session->capture_source);
                 session->capture_source = nullptr;
                 blog(LOG_INFO, "[Remote Server] Stopped streaming");
@@ -537,6 +615,12 @@ static void handle_client(socket_t client_socket) {
     obs_leave_graphics();
     
     if (session->capture_source) {
+        // 移除音頻回調
+        obs_source_remove_audio_capture_callback(
+            session->capture_source, audio_capture_callback, session.get());
+        // 停用子源
+        obs_source_dec_active(session->capture_source);
+        obs_source_dec_showing(session->capture_source);
         obs_source_release(session->capture_source);
     }
 

@@ -15,6 +15,10 @@
 
 #include "net-protocol.h"
 
+#ifdef HAVE_GRPC
+#include "grpc_client.h"
+#endif
+
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -86,9 +90,44 @@ struct remote_source_data {
     std::mutex props_mutex;
     std::string cached_properties_json;
     std::vector<std::pair<std::string, std::string>> window_list;
+    
+    // 動態屬性緩存 (從遠端解析)
+    struct CachedProperty {
+        std::string name;
+        std::string description;
+        int type;  // OBS_PROPERTY_* 類型
+        bool visible;
+        
+        // LIST 類型的選項
+        std::vector<std::pair<std::string, std::string>> items;  // name, value
+        int list_format;  // 0=string, 1=int
+        std::string current_string;
+        long long current_int;
+        
+        // BOOL 類型
+        bool default_bool;
+        
+        // INT 類型
+        int min_int, max_int, step_int, default_int;
+        
+        // FLOAT 類型
+        double min_float, max_float, step_float, default_float;
+        
+        // TEXT 類型
+        std::string default_text;
+        
+        CachedProperty() : type(0), visible(true), list_format(0), current_int(0),
+                          default_bool(false), min_int(0), max_int(100), step_int(1), default_int(0),
+                          min_float(0), max_float(1), step_float(0.01), default_float(0) {}
+    };
+    std::vector<CachedProperty> cached_props;
 
 #ifdef HAVE_TURBOJPEG
     tjhandle jpeg_decompressor;
+#endif
+
+#ifdef HAVE_GRPC
+    grpc_client_t grpc_client;
 #endif
 
     remote_source_data() :
@@ -105,6 +144,9 @@ struct remote_source_data {
         frame_ready(false)
 #ifdef HAVE_TURBOJPEG
         , jpeg_decompressor(nullptr)
+#endif
+#ifdef HAVE_GRPC
+        , grpc_client(nullptr)
 #endif
     {}
 };
@@ -134,11 +176,174 @@ static bool recv_all(socket_t sock, void* data, size_t len) {
     return true;
 }
 
+// ========== 簡易 JSON 解析輔助函數 ==========
+static std::string json_get_string(const std::string& json, const std::string& key, size_t start = 0) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search, start);
+    if (pos == std::string::npos) return "";
+    pos += search.length();
+    size_t end = json.find("\"", pos);
+    if (end == std::string::npos) return "";
+    return json.substr(pos, end - pos);
+}
+
+static int json_get_int(const std::string& json, const std::string& key, size_t start = 0) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search, start);
+    if (pos == std::string::npos) return 0;
+    pos += search.length();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.size()) return 0;
+    size_t end = pos;
+    if (json[end] == '-') end++;
+    while (end < json.size() && isdigit(json[end])) end++;
+    if (end == pos) return 0;
+    return std::stoi(json.substr(pos, end - pos));
+}
+
+static double json_get_double(const std::string& json, const std::string& key, size_t start = 0) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search, start);
+    if (pos == std::string::npos) return 0.0;
+    pos += search.length();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    if (pos >= json.size()) return 0.0;
+    size_t end = pos;
+    while (end < json.size() && (isdigit(json[end]) || json[end] == '.' || json[end] == '-' || json[end] == 'e' || json[end] == 'E' || json[end] == '+')) end++;
+    if (end == pos) return 0.0;
+    return std::stod(json.substr(pos, end - pos));
+}
+
+static bool json_get_bool(const std::string& json, const std::string& key, size_t start = 0) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search, start);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    return (pos < json.size() && json[pos] == 't');
+}
+
+// ========== 解析 JSON 屬性到緩存 ==========
+static void parse_properties_json(remote_source_data* data) {
+    std::lock_guard<std::mutex> lock(data->props_mutex);
+    data->cached_props.clear();
+    
+    const std::string& json = data->cached_properties_json;
+    if (json.empty()) return;
+    
+    // 找到 properties 數組
+    size_t props_start = json.find("\"properties\":[");
+    if (props_start == std::string::npos) return;
+    props_start += 14;
+    
+    // 遍歷每個屬性對象
+    size_t pos = props_start;
+    while (pos < json.size()) {
+        size_t obj_start = json.find("{\"name\":", pos);
+        if (obj_start == std::string::npos) break;
+        
+        // 找到這個對象的結束
+        int brace = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < json.size() && brace > 0) {
+            if (json[obj_end] == '{') brace++;
+            else if (json[obj_end] == '}') brace--;
+            obj_end++;
+        }
+        
+        std::string obj = json.substr(obj_start, obj_end - obj_start);
+        
+        remote_source_data::CachedProperty prop;
+        prop.name = json_get_string(obj, "name");
+        prop.description = json_get_string(obj, "description");
+        prop.type = json_get_int(obj, "type");
+        prop.visible = json_get_bool(obj, "visible");
+        
+        // LIST 類型解析 items
+        if (prop.type == OBS_PROPERTY_LIST) {
+            size_t items_pos = obj.find("\"items\":[");
+            if (items_pos != std::string::npos) {
+                items_pos += 9;
+                size_t items_end = obj.find("]", items_pos);
+                std::string items_str = obj.substr(items_pos, items_end - items_pos);
+                
+                size_t item_pos = 0;
+                while ((item_pos = items_str.find("{\"name\":", item_pos)) != std::string::npos) {
+                    std::string item_name = json_get_string(items_str, "name", item_pos);
+                    std::string item_value = json_get_string(items_str, "value", item_pos);
+                    if (item_value.empty()) item_value = item_name;
+                    prop.items.push_back({item_name, item_value});
+                    item_pos++;
+                }
+            }
+            prop.current_string = json_get_string(obj, "current");
+        }
+        
+        // BOOL 類型
+        if (prop.type == OBS_PROPERTY_BOOL) {
+            prop.default_bool = json_get_bool(obj, "default");
+        }
+        
+        // INT 類型
+        if (prop.type == OBS_PROPERTY_INT) {
+            prop.min_int = json_get_int(obj, "min");
+            prop.max_int = json_get_int(obj, "max");
+            prop.step_int = json_get_int(obj, "step");
+            prop.default_int = json_get_int(obj, "default");
+        }
+        
+        // FLOAT 類型
+        if (prop.type == OBS_PROPERTY_FLOAT) {
+            prop.min_float = json_get_double(obj, "min");
+            prop.max_float = json_get_double(obj, "max");
+            prop.step_float = json_get_double(obj, "step");
+            prop.default_float = json_get_double(obj, "default");
+        }
+        
+        // TEXT 類型
+        if (prop.type == OBS_PROPERTY_TEXT) {
+            prop.default_text = json_get_string(obj, "default");
+        }
+        
+        if (!prop.name.empty()) {
+            data->cached_props.push_back(prop);
+        }
+        
+        pos = obj_end;
+    }
+    
+    blog(LOG_INFO, "[Remote Source] Parsed %zu properties from JSON", data->cached_props.size());
+}
+
 // ========== 連接伺服器 ==========
 static bool connect_to_server(remote_source_data* data) {
     if (data->connected.load()) return true;
     if (data->server_ip.empty()) return false;
 
+#ifdef HAVE_GRPC
+    // gRPC 模式：創建客戶端並連接
+    if (data->grpc_client) {
+        grpc_client_destroy(data->grpc_client);
+    }
+    
+    char address[256];
+    snprintf(address, sizeof(address), "%s:%d", data->server_ip.c_str(), data->server_port);
+    data->grpc_client = grpc_client_create(address);
+    
+    if (data->grpc_client && grpc_client_wait_connected(data->grpc_client, 5000)) {
+        data->connected.store(true);
+        blog(LOG_INFO, "[Remote Source] gRPC connected to %s", address);
+        return true;
+    }
+    
+    blog(LOG_WARNING, "[Remote Source] gRPC failed to connect to %s", address);
+    if (data->grpc_client) {
+        grpc_client_destroy(data->grpc_client);
+        data->grpc_client = nullptr;
+    }
+    return false;
+#else
+    // Socket 模式
 #ifdef _WIN32
     static bool wsa_initialized = false;
     if (!wsa_initialized) {
@@ -183,12 +388,20 @@ static bool connect_to_server(remote_source_data* data) {
     blog(LOG_INFO, "[Remote Source] Connected to %s:%d",
          data->server_ip.c_str(), data->server_port);
     return true;
+#endif
 }
 
 static void disconnect_from_server(remote_source_data* data) {
     data->streaming.store(false);
     data->connected.store(false);
 
+#ifdef HAVE_GRPC
+    if (data->grpc_client) {
+        grpc_client_stop_stream(data->grpc_client);
+        grpc_client_destroy(data->grpc_client);
+        data->grpc_client = nullptr;
+    }
+#else
     if (data->socket != SOCKET_INVALID) {
         CLOSE_SOCKET(data->socket);
         data->socket = SOCKET_INVALID;
@@ -197,6 +410,7 @@ static void disconnect_from_server(remote_source_data* data) {
     if (data->receive_thread.joinable()) {
         data->receive_thread.join();
     }
+#endif
 }
 
 // ========== 請求屬性列表 ==========
@@ -204,14 +418,73 @@ static void disconnect_from_server(remote_source_data* data) {
 static void stop_streaming(remote_source_data* data);
 
 static bool request_properties(remote_source_data* data) {
-    // 如果正在串流，先停止
+    // 如果正在串流，先停止並斷開連接以清除 socket 緩衝區
     if (data->streaming.load()) {
         blog(LOG_INFO, "[Remote Source] Stopping current stream before refreshing properties");
         stop_streaming(data);
     }
     
+    // 斷開現有連接以確保乾淨的 socket 狀態
+    if (data->connected.load()) {
+        disconnect_from_server(data);
+    }
+    
     if (!connect_to_server(data)) return false;
 
+#ifdef HAVE_GRPC
+    // gRPC 模式：使用 gRPC 客戶端獲取屬性
+    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
+        ? "game_capture" : "window_capture";
+    
+    if (!grpc_client_get_properties(data->grpc_client, source_type)) {
+        blog(LOG_WARNING, "[Remote Source] gRPC GetProperties failed");
+        return false;
+    }
+    
+    // 從 gRPC 響應填充 cached_props
+    {
+        std::lock_guard<std::mutex> lock(data->props_mutex);
+        data->cached_props.clear();
+        data->window_list.clear();
+        
+        size_t count = grpc_client_property_count(data->grpc_client);
+        for (size_t i = 0; i < count; i++) {
+            remote_source_data::CachedProperty prop;
+            prop.name = grpc_client_property_name(data->grpc_client, i);
+            prop.description = grpc_client_property_description(data->grpc_client, i);
+            prop.type = grpc_client_property_type(data->grpc_client, i);
+            prop.visible = true;
+            
+            // 處理 LIST 類型
+            if (prop.type == 6) {  // OBS_PROPERTY_LIST
+                size_t item_count = grpc_client_property_item_count(data->grpc_client, i);
+                for (size_t j = 0; j < item_count; j++) {
+                    const char* item_name = grpc_client_property_item_name(data->grpc_client, i, j);
+                    const char* item_value = grpc_client_property_item_value(data->grpc_client, i, j);
+                    prop.items.push_back({
+                        item_name ? item_name : "",
+                        item_value ? item_value : ""
+                    });
+                    
+                    // 填充視窗列表 (如果是 window 屬性)
+                    if (prop.name == "window") {
+                        data->window_list.push_back({
+                            item_name ? item_name : "",
+                            item_value ? item_value : ""
+                        });
+                    }
+                }
+            }
+            
+            data->cached_props.push_back(prop);
+        }
+    }
+    
+    blog(LOG_INFO, "[Remote Source] gRPC: Got %zu properties, %zu windows",
+         data->cached_props.size(), data->window_list.size());
+    return true;
+#else
+    // Socket 模式
     // 使用 socket mutex 保護操作
     std::lock_guard<std::mutex> socket_lock(data->socket_mutex);
 
@@ -340,7 +613,12 @@ static bool request_properties(remote_source_data* data) {
 
     blog(LOG_INFO, "[Remote Source] Parsed %zu items from properties",
          data->window_list.size());
+    
+    // 解析所有屬性到緩存用於動態 UI
+    parse_properties_json(data);
+    
     return true;
+#endif  // HAVE_GRPC
 }
 
 // ========== 接收線程 ==========
@@ -432,6 +710,65 @@ static void receive_thread_func(remote_source_data* data) {
 }
 
 // ========== 開始串流 ==========
+#ifdef HAVE_GRPC
+// gRPC 視頻回調
+static void grpc_video_callback(uint32_t width, uint32_t height,
+                                 const uint8_t* jpeg_data, size_t jpeg_size,
+                                 uint64_t timestamp_ns, void* user_data) {
+    UNUSED_PARAMETER(timestamp_ns);
+    remote_source_data* data = (remote_source_data*)user_data;
+    if (!data) return;
+    
+#ifdef HAVE_TURBOJPEG
+    // 解碼 JPEG
+    int w, h, subsamp, colorspace;
+    if (tjDecompressHeader3(data->jpeg_decompressor,
+            jpeg_data, (unsigned long)jpeg_size,
+            &w, &h, &subsamp, &colorspace) == 0) {
+        
+        size_t buffer_size = w * h * 4;  // RGBA
+        std::vector<uint8_t> decoded(buffer_size);
+        
+        if (tjDecompress2(data->jpeg_decompressor,
+                jpeg_data, (unsigned long)jpeg_size,
+                decoded.data(), w, 0, h,
+                TJPF_BGRA, TJFLAG_FASTDCT) == 0) {
+            
+            std::lock_guard<std::mutex> lock(data->video_mutex);
+            data->tex_width = w;
+            data->tex_height = h;
+            data->frame_buffer = std::move(decoded);
+            data->frame_ready = true;
+        }
+    }
+#else
+    UNUSED_PARAMETER(width);
+    UNUSED_PARAMETER(height);
+    UNUSED_PARAMETER(jpeg_data);
+    UNUSED_PARAMETER(jpeg_size);
+#endif
+}
+
+// gRPC 音頻回調
+static void grpc_audio_callback(uint32_t sample_rate, uint32_t channels,
+                                 const float* pcm_data, size_t samples,
+                                 uint64_t timestamp_ns, void* user_data) {
+    remote_source_data* data = (remote_source_data*)user_data;
+    if (!data || !data->audio_capture) return;
+    
+    // 構建 OBS 音頻結構
+    struct obs_source_audio audio = {};
+    audio.data[0] = (uint8_t*)pcm_data;
+    audio.frames = (uint32_t)samples;
+    audio.speakers = (channels == 2) ? SPEAKERS_STEREO : SPEAKERS_MONO;
+    audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+    audio.samples_per_sec = sample_rate;
+    audio.timestamp = timestamp_ns;
+    
+    obs_source_output_audio(data->source, &audio);
+}
+#endif  // HAVE_GRPC
+
 static void start_streaming(remote_source_data* data) {
     if (data->streaming.load()) {
         blog(LOG_DEBUG, "[Remote Source] Already streaming, ignoring start request");
@@ -441,6 +778,27 @@ static void start_streaming(remote_source_data* data) {
 
     blog(LOG_INFO, "[Remote Source] Starting stream with window: %s", data->selected_window.c_str());
 
+#ifdef HAVE_GRPC
+    // gRPC 模式：使用 gRPC 客戶端開始串流
+    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
+        ? "game_capture" : "window_capture";
+    
+    // 構建設定
+    const char* keys[] = {"window"};
+    const char* values[] = {data->selected_window.c_str()};
+    
+    data->streaming.store(true);
+    
+    if (!grpc_client_start_stream(data->grpc_client, source_type,
+            keys, values, 1,
+            grpc_video_callback, grpc_audio_callback, data)) {
+        blog(LOG_WARNING, "[Remote Source] gRPC StartStream failed");
+        data->streaming.store(false);
+    } else {
+        blog(LOG_INFO, "[Remote Source] gRPC stream started");
+    }
+#else
+    // Socket 模式
     // 構建設定 JSON
     std::ostringstream json;
     json << "{";
@@ -478,6 +836,7 @@ static void start_streaming(remote_source_data* data) {
     // 啟動接收線程
     data->streaming.store(true);
     data->receive_thread = std::thread(receive_thread_func, data);
+#endif  // HAVE_GRPC
 }
 
 static void stop_streaming(remote_source_data* data) {
@@ -488,6 +847,13 @@ static void stop_streaming(remote_source_data* data) {
     // 先標記停止，讓接收線程知道要結束
     data->streaming.store(false);
 
+#ifdef HAVE_GRPC
+    // gRPC 模式
+    if (data->grpc_client) {
+        grpc_client_stop_stream(data->grpc_client);
+    }
+#else
+    // Socket 模式
     // 發送停止請求 (需要 socket 保護)
     if (data->connected.load() && data->socket != SOCKET_INVALID) {
         std::lock_guard<std::mutex> lock(data->socket_mutex);
@@ -500,6 +866,7 @@ static void stop_streaming(remote_source_data* data) {
     if (data->receive_thread.joinable()) {
         data->receive_thread.join();
     }
+#endif  // HAVE_GRPC
 
     blog(LOG_INFO, "[Remote Source] Stream stopped");
 }
@@ -524,6 +891,10 @@ static void* remote_source_create(obs_data_t* settings, obs_source_t* source) {
     data->capture_mode = (int)obs_data_get_int(settings, "capture_mode");
     data->selected_window = obs_data_get_string(settings, "selected_window");
     data->audio_capture = obs_data_get_bool(settings, "audio_capture");
+    
+    // 設置音頻狀態
+    obs_source_set_audio_mixers(source, 0x3F);  // 啟用所有音頻軌道
+    obs_source_set_audio_active(source, true);  // 啟用音頻
 
     return data;
 }
@@ -684,7 +1055,7 @@ static bool on_refresh_clicked(obs_properties_t* props, obs_property_t* p,
 }
 
 static obs_properties_t* remote_source_properties(void* data_ptr) {
-    UNUSED_PARAMETER(data_ptr);
+    remote_source_data* data = (remote_source_data*)data_ptr;
 
     obs_properties_t* props = obs_properties_create();
 
@@ -704,9 +1075,49 @@ static obs_properties_t* remote_source_properties(void* data_ptr) {
     obs_properties_add_button(props, "refresh",
         "刷新列表 (Refresh)", on_refresh_clicked);
 
-    // 視窗選擇
-    obs_properties_add_list(props, "selected_window",
-        "目標視窗 (Target)", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    // 動態添加遠端子源的屬性
+    if (data) {
+        std::lock_guard<std::mutex> lock(data->props_mutex);
+        for (const auto& prop : data->cached_props) {
+            // 使用 child_ 前綴避免與本地屬性衝突
+            std::string child_name = "child_" + prop.name;
+            
+            switch (prop.type) {
+            case OBS_PROPERTY_LIST: {
+                obs_property_t* list = obs_properties_add_list(props, 
+                    child_name.c_str(), prop.description.c_str(),
+                    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+                for (const auto& item : prop.items) {
+                    obs_property_list_add_string(list, item.first.c_str(), item.second.c_str());
+                }
+                break;
+            }
+            case OBS_PROPERTY_BOOL:
+                obs_properties_add_bool(props, child_name.c_str(), prop.description.c_str());
+                break;
+            case OBS_PROPERTY_INT:
+                obs_properties_add_int(props, child_name.c_str(), prop.description.c_str(),
+                    prop.min_int, prop.max_int, prop.step_int);
+                break;
+            case OBS_PROPERTY_FLOAT:
+                obs_properties_add_float(props, child_name.c_str(), prop.description.c_str(),
+                    prop.min_float, prop.max_float, prop.step_float);
+                break;
+            case OBS_PROPERTY_TEXT:
+                obs_properties_add_text(props, child_name.c_str(), prop.description.c_str(),
+                    OBS_TEXT_DEFAULT);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    // 備用：如果沒有動態屬性，使用靜態視窗選擇
+    if (!data || data->cached_props.empty()) {
+        obs_properties_add_list(props, "selected_window",
+            "目標視窗 (Target)", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    }
 
     // 音頻捕捉
     obs_properties_add_bool(props, "audio_capture",
