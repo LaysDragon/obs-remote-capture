@@ -257,6 +257,10 @@ static void* capture_preview_create(obs_data_t* settings, obs_source_t* source) 
     capture_preview_data* data = new capture_preview_data();
     data->source = source;
     
+    // 啟用所有音頻軌道
+    obs_source_set_audio_mixers(source, 0x3F);
+    obs_source_set_audio_active(data->source, false);
+    
     capture_preview_update(data, settings);
     
     blog(LOG_INFO, "[Capture Preview] Source created");
@@ -381,6 +385,16 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
         
         obs_source_update(data->capture_source, child_settings);
         obs_data_release(child_settings);
+        os_sleep_ms(1);
+        
+        // 同步音頻活動狀態（設定更新後可能改變）
+        uint32_t child_flags = obs_source_get_output_flags(data->capture_source);
+        if (child_flags & OBS_SOURCE_AUDIO) {
+            bool audio_active = obs_source_audio_active(data->capture_source);
+            obs_source_set_audio_active(data->source, audio_active);
+            blog(LOG_INFO, "[Capture Preview] Update child source audio support: %s (audio_active=%d)", 
+                 obs_source_get_name(data->capture_source), audio_active);
+        }
     }
 }
 
@@ -652,7 +666,7 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
         // 類型不同，需要銷毀舊的
         blog(LOG_INFO, "[Capture Preview] Changing source type from %s to %s", current_type, source_type);
         
-        // 移除音頻回調
+        // 移除音頻回調（如果之前註冊過）
         obs_source_remove_audio_capture_callback(data->capture_source, audio_capture_callback, data);
         
         obs_source_dec_active(data->capture_source);
@@ -670,10 +684,25 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
         obs_source_inc_showing(data->capture_source);
         obs_source_inc_active(data->capture_source);
         
-        // 註冊音頻捕獲回調
-        obs_source_add_audio_capture_callback(data->capture_source, audio_capture_callback, data);
+        // 檢查子源是否支持音頻
+        uint32_t child_flags = obs_source_get_output_flags(data->capture_source);
+        bool has_audio = (child_flags & OBS_SOURCE_AUDIO) != 0;
         
-        blog(LOG_INFO, "[Capture Preview] Created and activated child source with audio: %s", source_type);
+        if (has_audio) {
+            // 註冊音頻捕獲回調
+            obs_source_add_audio_capture_callback(data->capture_source, audio_capture_callback, data);
+            
+            // 同步子源的音頻活動狀態到父源
+            bool audio_active = obs_source_audio_active(data->capture_source);
+            obs_source_set_audio_active(data->source, audio_active);
+            
+            blog(LOG_INFO, "[Capture Preview] Created child source with audio support: %s (audio_active=%d)", 
+                 source_type, audio_active);
+        } else {
+            // 子源不支持音頻，禁用父源音頻
+            obs_source_set_audio_active(data->source, false);
+            blog(LOG_INFO, "[Capture Preview] Created child source without audio: %s", source_type);
+        }
     } else {
         blog(LOG_ERROR, "[Capture Preview] Failed to create child source: %s", source_type);
     }
