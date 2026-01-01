@@ -92,6 +92,8 @@ static void capture_preview_video_render(void* data, gs_effect_t* effect);
 static uint32_t capture_preview_get_width(void* data);
 static uint32_t capture_preview_get_height(void* data);
 static void ensure_capture_source_type(capture_preview_data* data, const char* source_type);
+static void audio_capture_callback(void* param, obs_source_t* source, 
+                                    const struct audio_data* audio, bool muted);
 
 // 舊的 create_capture_source 已被 ensure_capture_source_type 取代
 
@@ -267,6 +269,8 @@ static void capture_preview_destroy(void* data_ptr) {
     capture_preview_deactivate(data);
     
     if (data->capture_source) {
+        // 移除音頻回調
+        obs_source_remove_audio_capture_callback(data->capture_source, audio_capture_callback, data);
         obs_source_release(data->capture_source);
     }
     
@@ -608,6 +612,29 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
     }
 }
 
+// ========== 音頻捕獲回調 - 轉發子源音頻到父源 ==========
+static void audio_capture_callback(void* param, obs_source_t* source, 
+                                    const struct audio_data* audio, bool muted) {
+    UNUSED_PARAMETER(source);
+    UNUSED_PARAMETER(muted);
+    
+    capture_preview_data* data = (capture_preview_data*)param;
+    if (data->source && audio && audio->frames > 0) {
+        // 將子源的音頻轉發到父源
+        struct obs_source_audio out_audio = {};
+        for (size_t i = 0; i < MAX_AV_PLANES && audio->data[i]; i++) {
+            out_audio.data[i] = audio->data[i];
+        }
+        out_audio.frames = audio->frames;
+        out_audio.speakers = SPEAKERS_STEREO;  // 假設立體聲
+        out_audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+        out_audio.samples_per_sec = 48000;  // 假設 48kHz
+        out_audio.timestamp = audio->timestamp;
+        
+        obs_source_output_audio(data->source, &out_audio);
+    }
+}
+
 // ========== 確保子源存在且類型正確 ==========
 static void ensure_capture_source_type(capture_preview_data* data, const char* source_type) {
     if (!source_type || strlen(source_type) == 0) {
@@ -624,6 +651,10 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
         
         // 類型不同，需要銷毀舊的
         blog(LOG_INFO, "[Capture Preview] Changing source type from %s to %s", current_type, source_type);
+        
+        // 移除音頻回調
+        obs_source_remove_audio_capture_callback(data->capture_source, audio_capture_callback, data);
+        
         obs_source_dec_active(data->capture_source);
         obs_source_dec_showing(data->capture_source);
         obs_source_release(data->capture_source);
@@ -638,7 +669,11 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
         // 激活子源
         obs_source_inc_showing(data->capture_source);
         obs_source_inc_active(data->capture_source);
-        blog(LOG_INFO, "[Capture Preview] Created and activated child source: %s", source_type);
+        
+        // 註冊音頻捕獲回調
+        obs_source_add_audio_capture_callback(data->capture_source, audio_capture_callback, data);
+        
+        blog(LOG_INFO, "[Capture Preview] Created and activated child source with audio: %s", source_type);
     } else {
         blog(LOG_ERROR, "[Capture Preview] Failed to create child source: %s", source_type);
     }
@@ -979,7 +1014,7 @@ void init_capture_preview_info() {
     
     capture_preview_info.id = "capture_preview";
     capture_preview_info.type = OBS_SOURCE_TYPE_INPUT;
-    capture_preview_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
+    capture_preview_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW;
     
     capture_preview_info.get_name = capture_preview_get_name;
     capture_preview_info.create = capture_preview_create;
