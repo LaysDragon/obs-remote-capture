@@ -424,7 +424,7 @@ bool areEqual(const T& a, const T& b) {
         blog(LOG_INFO, "[Capture Preview] areEqual: a=%s, b=%s, result=%d", a, b, strcmp(a, b) == 0);   
         return strcmp(a, b) == 0;
     }
-    if constexpr (std::is_same_v<T, int> || std::is_same_v<T, double>) {
+    if constexpr (std::is_same_v<T, int> || std::is_same_v<T, double> || std::is_same_v<T, __int64>) {
         blog(LOG_INFO, "[Capture Preview] areEqual: a=%d, b=%d, result=%d", a, b, a == b);   
         return a == b;
     }
