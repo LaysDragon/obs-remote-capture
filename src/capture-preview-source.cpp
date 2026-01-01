@@ -786,7 +786,8 @@ static bool on_source_type_changed(obs_properties_t* props, obs_property_t* prop
         blog(LOG_INFO, "[Capture Preview] Source type changed from %s to %s", old_type, new_type);
         
         // 重新克隆子源的屬性
-        clone_properties_from_child(props, data);
+        // clone_properties_from_child(props, data);
+        update_child_and_refresh_props(props, settings, data);
         
         // ===== DEBUG: 列出最終的所有屬性 =====
         blog(LOG_INFO, "[Capture Preview] === Final properties list (on_source_type_changed) ===");
