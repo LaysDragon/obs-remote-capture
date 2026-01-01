@@ -22,8 +22,7 @@
 #include <cstring>
 
 // ========== 常量定義 ==========
-#define CAPTURE_MODE_WINDOW 0
-#define CAPTURE_MODE_GAME   1
+#define DEFAULT_SOURCE_TYPE "window_capture"
 #define DEFAULT_DELAY_MS    2000
 #define CAPTURE_FPS         30
 
@@ -46,7 +45,7 @@ struct capture_preview_data {
     obs_source_t* capture_source;   // 內部的 window/game capture (持久化)
     
     // 設定
-    int capture_mode;               // 0=Window, 1=Game
+    std::string source_type;        // 子源類型 ID (如 "window_capture", "game_capture" 等)
     int delay_ms;                   // 延遲毫秒數
     
     // 視頻緩衝 (環形隊列)
@@ -68,7 +67,7 @@ struct capture_preview_data {
     capture_preview_data() :
         source(nullptr),
         capture_source(nullptr),
-        capture_mode(CAPTURE_MODE_WINDOW),
+        source_type(DEFAULT_SOURCE_TYPE),
         delay_ms(DEFAULT_DELAY_MS),
         texrender(nullptr),
         stagesurface(nullptr),
@@ -92,7 +91,7 @@ static void capture_preview_video_tick(void* data, float seconds);
 static void capture_preview_video_render(void* data, gs_effect_t* effect);
 static uint32_t capture_preview_get_width(void* data);
 static uint32_t capture_preview_get_height(void* data);
-static void ensure_capture_source_type(capture_preview_data* data, int mode);
+static void ensure_capture_source_type(capture_preview_data* data, const char* source_type);
 
 // 舊的 create_capture_source 已被 ensure_capture_source_type 取代
 
@@ -354,22 +353,27 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     blog(LOG_INFO, "[Capture Preview] Update");
     capture_preview_data* data = (capture_preview_data*)data_ptr;
     
-    int new_mode = (int)obs_data_get_int(settings, "capture_mode");
+    const char* new_source_type = obs_data_get_string(settings, "source_type");
     int new_delay = (int)obs_data_get_int(settings, "delay_ms");
     
-    data->capture_mode = new_mode;
+    // 如果沒有設定源類型，使用默認值
+    if (!new_source_type || strlen(new_source_type) == 0) {
+        new_source_type = DEFAULT_SOURCE_TYPE;
+    }
+    
+    data->source_type = new_source_type;
     data->delay_ms = new_delay;
     
     // 確保子源存在並且類型正確（處理 OBS 重啟後的初始化）
-    ensure_capture_source_type(data, new_mode);
+    ensure_capture_source_type(data, new_source_type);
     
     // 翻譯設定並傳遞給子源
     if (data->capture_source) {
         obs_data_t* child_settings = extract_child_settings(settings);
         
         const char* window = obs_data_get_string(child_settings, "window");
-        blog(LOG_INFO, "[Capture Preview] Update: mode=%d, delay=%d, window=%s", 
-             data->capture_mode, data->delay_ms, window ? window : "(null)");
+        blog(LOG_INFO, "[Capture Preview] Update: source_type=%s, delay=%d, window=%s", 
+             data->source_type.c_str(), data->delay_ms, window ? window : "(null)");
         
         obs_source_update(data->capture_source, child_settings);
         obs_data_release(child_settings);
@@ -395,6 +399,7 @@ static const char* type_to_string(enum obs_data_type type) {
     }
 }
 
+//TODO: static?
 template <typename T>
 bool areEqual(const T& a, const T& b) {
     if constexpr (std::is_same_v<T, const char*> || std::is_same_v<T, std::string>) {
@@ -604,18 +609,21 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
 }
 
 // ========== 確保子源存在且類型正確 ==========
-static void ensure_capture_source_type(capture_preview_data* data, int mode) {
-    const char* needed_type = (mode == CAPTURE_MODE_GAME) ? "game_capture" : "window_capture";
+static void ensure_capture_source_type(capture_preview_data* data, const char* source_type) {
+    if (!source_type || strlen(source_type) == 0) {
+        blog(LOG_WARNING, "[Capture Preview] Invalid source type");
+        return;
+    }
     
     // 如果已有子源且類型匹配，不需要重建
     if (data->capture_source) {
         const char* current_type = obs_source_get_id(data->capture_source);
-        if (strcmp(current_type, needed_type) == 0) {
+        if (strcmp(current_type, source_type) == 0) {
             return;  // 類型相同，不需要重建
         }
         
         // 類型不同，需要銷毀舊的
-        blog(LOG_INFO, "[Capture Preview] Changing source type from %s to %s", current_type, needed_type);
+        blog(LOG_INFO, "[Capture Preview] Changing source type from %s to %s", current_type, source_type);
         obs_source_dec_active(data->capture_source);
         obs_source_dec_showing(data->capture_source);
         obs_source_release(data->capture_source);
@@ -623,16 +631,16 @@ static void ensure_capture_source_type(capture_preview_data* data, int mode) {
     }
     
     // 創建新的子源
-    blog(LOG_INFO, "[Capture Preview] Creating persistent child source: %s", needed_type);
-    data->capture_source = obs_source_create_private(needed_type, "__capture_preview_internal__", nullptr);
+    blog(LOG_INFO, "[Capture Preview] Creating persistent child source: %s", source_type);
+    data->capture_source = obs_source_create_private(source_type, "__capture_preview_internal__", nullptr);
     
     if (data->capture_source) {
         // 激活子源
         obs_source_inc_showing(data->capture_source);
         obs_source_inc_active(data->capture_source);
-        blog(LOG_INFO, "[Capture Preview] Created and activated child source: %s", needed_type);
+        blog(LOG_INFO, "[Capture Preview] Created and activated child source: %s", source_type);
     } else {
-        blog(LOG_ERROR, "[Capture Preview] Failed to create child source: %s", needed_type);
+        blog(LOG_ERROR, "[Capture Preview] Failed to create child source: %s", source_type);
     }
 }
 
@@ -690,40 +698,34 @@ static void deferred_update_properties(void* param) {
     }
 }
 
-// ========== 模式切換回調 ==========
-static bool on_mode_changed(obs_properties_t* props, obs_property_t* prop, obs_data_t* settings) {
+// ========== 源類型切換回調 ==========
+static bool on_source_type_changed(obs_properties_t* props, obs_property_t* prop, obs_data_t* settings) {
     UNUSED_PARAMETER(prop);
     
     capture_preview_data* data = (capture_preview_data*)obs_properties_get_param(props);
     if (!data) return false;
     
-    int new_mode = (int)obs_data_get_int(settings, "capture_mode");
-    int old_mode = data->capture_mode;
+    const char* new_type = obs_data_get_string(settings, "source_type");
+    const char* old_type = data->source_type.c_str();
     
-    // 只有模式真正改變時才重建
-    if (new_mode != old_mode) {
-        data->capture_mode = new_mode;
+    // 只有類型真正改變時才重建
+    if (!new_type || strlen(new_type) == 0) {
+        return false;
+    }
+    
+    if (strcmp(new_type, old_type) != 0) {
+        data->source_type = new_type;
         
         // 確保子源類型正確
-        ensure_capture_source_type(data, new_mode);
+        ensure_capture_source_type(data, new_type);
         
-        blog(LOG_INFO, "[Capture Preview] Mode changed from %d to %d (%s)", 
-             old_mode, new_mode,
-             (new_mode == CAPTURE_MODE_GAME) ? "game_capture" : "window_capture");
+        blog(LOG_INFO, "[Capture Preview] Source type changed from %s to %s", old_type, new_type);
         
-        // 使用 obs_queue_task 延遲到 UI 執行緒的下一個事件循環
-        // 避免在 modified_callback 處理期間直接調用 obs_source_update_properties 導致崩潰
-        // if (data->source) {
-            // obs_queue_task(OBS_TASK_UI, deferred_update_properties, data->source, false);
-            // obs_source_t* ref = obs_source_get_ref(data->source);  // 增加引用避免被銷毀
-            // if (ref) {
-            //     obs_queue_task(OBS_TASK_UI, deferred_update_properties, ref, false);
-            // }
-        // }
+        // 重新克隆子源的屬性
         clone_properties_from_child(props, data);
         
         // ===== DEBUG: 列出最終的所有屬性 =====
-        blog(LOG_INFO, "[Capture Preview] === Final properties list (on_mode_changed) ===");
+        blog(LOG_INFO, "[Capture Preview] === Final properties list (on_source_type_changed) ===");
         obs_property_t* debug_prop = obs_properties_first(props);
         int total_count = 0;
         while (debug_prop) {
@@ -738,13 +740,53 @@ static bool on_mode_changed(obs_properties_t* props, obs_property_t* prop, obs_d
     }
     return false;
 }
+// 白名單：只列出捕捉相關的源類型
+static const char* capture_source_whitelist[] = {
+    "window_capture",       // 視窗擷取
+    "game_capture",         // 遊戲擷取
+    "monitor_capture",      // 顯示器擷取 (Mac)
+    "display_capture",      // 顯示器擷取 (Windows)
+    "dshow_input",          // 視訊擷取裝置 (DirectShow)
+    "v4l2_input",           // 視訊擷取裝置 (Linux V4L2)
+    "av_capture_input",     // 視訊擷取裝置 (Mac)
+    "browser_source",       // 瀏覽器來源
+    "ndi_source",           // NDI 源 (如果安裝了 NDI 插件)
+    "obs-ndi-source",       // NDI 源 (另一種 ID)
+    "pipewire-desktop-capture-source",  // PipeWire 桌面擷取 (Linux)
+    "xshm_input",           // X11 擷取 (Linux)
+    "xcomposite_input",     // X11 Composite 擷取 (Linux)
+    nullptr  // 結束標記
+};
+
+// 獲取可用的捕捉源列表 (返回 id 和顯示名稱對)
+static std::vector<std::pair<std::string, std::string>> get_available_capture_sources() {
+    std::vector<std::pair<std::string, std::string>> sources;
+    
+    for (size_t i = 0; capture_source_whitelist[i] != nullptr; i++) {
+        const char* source_id = capture_source_whitelist[i];
+        
+        // 檢查此源類型是否可用（已註冊）
+        uint32_t output_flags = obs_get_source_output_flags(source_id);
+        if (output_flags == 0) {
+            continue;  // 此源類型不存在
+        }
+        
+        // 獲取源類型的顯示名稱
+        const char* display_name = obs_source_get_display_name(source_id);
+        std::string name = (display_name && strlen(display_name) > 0) ? display_name : source_id;
+        
+        sources.emplace_back(source_id, name);
+    }
+    
+    return sources;
+}
 
 static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
     blog(LOG_INFO, "[Capture Preview] Getting properties");
     capture_preview_data* data = (capture_preview_data*)data_ptr;
     
     // 確保子源存在
-    ensure_capture_source_type(data, data->capture_mode);
+    ensure_capture_source_type(data, data->source_type.c_str());
     
     obs_properties_t* props = obs_properties_create();
     obs_properties_set_param(props, data, nullptr);
@@ -752,28 +794,21 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
     // ===== 延遲設定 (放在最上面) =====
     obs_properties_add_int_slider(props, "delay_ms", "Preview Delay (ms)", 0, 5000, 100);
     
-    // ===== 捕捉模式選擇 =====
-    obs_property_t* mode_prop = obs_properties_add_list(props, "capture_mode", "Capture Mode",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(mode_prop, "Window Capture", CAPTURE_MODE_WINDOW);
-    obs_property_list_add_int(mode_prop, "Game Capture", CAPTURE_MODE_GAME);
-    obs_property_set_modified_callback(mode_prop, on_mode_changed);
+    // ===== 源類型選擇 (白名單) =====
+    obs_property_t* type_prop = obs_properties_add_list(props, "source_type", "Source Type",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    
+    // 添加可用的源類型
+    auto available_sources = get_available_capture_sources();
+    for (const auto& source : available_sources) {
+        obs_property_list_add_string(type_prop, source.second.c_str(), source.first.c_str());
+    }
+    
+    obs_property_set_modified_callback(type_prop, on_source_type_changed);
     
     // ===== 分隔線/標題 =====
     obs_properties_add_text(props, "child_props_label", 
-        "--- Capture Source Settings ---", OBS_TEXT_INFO);
-    
-    // ===== 測試：條件式屬性 (名稱不同) =====
-    // if (data->capture_mode == CAPTURE_MODE_WINDOW) {
-    //     // Window 模式專用屬性
-    //     obs_properties_add_bool(props, "test_window_prop", "Test Window Property");
-    //     obs_properties_add_int(props, "test_window_int", "Window Int Value", 0, 100, 1);
-    // } 
-    // else {
-    //     // Game 模式專用屬性
-    //     obs_properties_add_bool(props, "test_game_prop", "Test Game Property");
-    //     obs_properties_add_int(props, "test_game_int", "Game Int Value", 0, 100, 1);
-    // }
+        "--- Wrapped Source Settings ---", OBS_TEXT_INFO);
     
     // ===== 從持久化子源克隆屬性 =====
     clone_properties_from_child(props, data);
@@ -794,7 +829,7 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
 }
 
 static void capture_preview_get_defaults(obs_data_t* settings) {
-    obs_data_set_default_int(settings, "capture_mode", CAPTURE_MODE_WINDOW);
+    obs_data_set_default_string(settings, "source_type", DEFAULT_SOURCE_TYPE);
     obs_data_set_default_int(settings, "delay_ms", DEFAULT_DELAY_MS);
 }
 
@@ -806,7 +841,7 @@ static void capture_preview_activate(void* data_ptr) {
     blog(LOG_INFO, "[Capture Preview] Activating...");
     
     // 確保子源存在（如果還沒創建的話）
-    ensure_capture_source_type(data, data->capture_mode);
+    ensure_capture_source_type(data, data->source_type.c_str());
     
     data->active.store(true);
     data->capture_thread = std::thread(capture_thread_func, data);
