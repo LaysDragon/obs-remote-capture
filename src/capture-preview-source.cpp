@@ -341,7 +341,7 @@ static bool update_child_and_refresh_props(obs_properties_t* props, obs_data_t* 
     
     // 短暫延遲，讓子源完成 update 的內部處理
     // 避免 obs_source_properties 與子源的內部鎖產生衝突
-    // os_sleep_ms(10);
+    os_sleep_ms(1);
     
     // 刷新子源屬性（子源可能因設定變化而更新其可用選項）
     clone_properties_from_child(props, data);
@@ -372,33 +372,96 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     }
 }
 
+static const char* type_to_string(enum obs_data_type type) {
+    switch (type) {
+    case OBS_DATA_NULL:
+        return "OBS_DATA_NULL";
+    case OBS_DATA_STRING:
+        return "OBS_DATA_STRING";
+    case OBS_DATA_NUMBER:
+        return "OBS_DATA_NUMBER";
+    case OBS_DATA_BOOLEAN:
+        return "OBS_DATA_BOOLEAN";
+    case OBS_DATA_OBJECT:
+        return "OBS_DATA_OBJECT";
+    case OBS_DATA_ARRAY:
+        return "OBS_DATA_ARRAY";
+    default:
+        return "Unknown";
+    }
+}
+
+template <typename T>
+bool areEqual(const T& a, const T& b) {
+    if constexpr (std::is_same_v<T, const char*> || std::is_same_v<T, std::string>) {
+        blog(LOG_INFO, "[Capture Preview] areEqual: a=%s, b=%s, result=%d", a, b, strcmp(a, b) == 0);   
+        return strcmp(a, b) == 0;
+    }
+    if constexpr (std::is_same_v<T, int> || std::is_same_v<T, double>) {
+        blog(LOG_INFO, "[Capture Preview] areEqual: a=%d, b=%d, result=%d", a, b, a == b);   
+        return a == b;
+    }
+    if constexpr (std::is_same_v<T, bool>) {
+        blog(LOG_INFO, "[Capture Preview] areEqual: a=%d, b=%d, result=%d", a, b, a == b);   
+        return a == b;
+    }
+    // not support
+    blog(LOG_INFO, "[Capture Preview] areEqual: not support type:%s", typeid(T).name());
+    return false;
+}
 
 static bool is_data_item_equal(obs_data_t* old_settings,obs_data_t* new_settings,const char * old_item_name,const char * new_item_name){
     obs_data_item_t* old_item = obs_data_item_byname(old_settings, old_item_name);
     obs_data_item_t* new_item = obs_data_item_byname(new_settings, new_item_name);
     enum obs_data_type dtype = obs_data_item_gettype(old_item);
     enum obs_data_type new_dtype = obs_data_item_gettype(new_item);
+    blog(LOG_INFO, "[Capture Preview] is_data_item_equal: old_item_name=%s, new_item_name=%s, dtype=%s, new_dtype=%s", old_item_name, new_item_name, type_to_string(dtype), type_to_string(new_dtype));
     if(dtype != new_dtype){
         return false;
     }
             
     switch ((int)dtype) {
         case OBS_DATA_STRING:       
-            return obs_data_item_get_string(old_item) == obs_data_item_get_string(new_item);
+            return  areEqual(obs_data_item_get_string(old_item), obs_data_item_get_string(new_item));
         case OBS_DATA_NUMBER:
             if (obs_data_item_numtype(old_item) == OBS_DATA_NUM_INT) {
-                return obs_data_item_get_int(old_item) == obs_data_item_get_int(new_item);
+                return areEqual(obs_data_item_get_int(old_item), obs_data_item_get_int(new_item));
             } else {
-                return obs_data_item_get_double(old_item) == obs_data_item_get_double(new_item);
+                return areEqual(obs_data_item_get_double(old_item), obs_data_item_get_double(new_item));
             }
         case OBS_DATA_BOOLEAN:
-            return obs_data_item_get_bool(old_item) == obs_data_item_get_bool(new_item);
+            return areEqual(obs_data_item_get_bool(old_item), obs_data_item_get_bool(new_item));
         default:
+        //TODO: not really sure what to do with unsupport type heres
             return true;
+    }
+}
+
+//TODO: seems broken => Property allow_transparency has no user value,new value=��D��,skip refresh properties!
+// what the hell is the garbage output here,seems like pointer problem....
+static std::string obs_data_get_any(obs_data_t* settings, const char* key){
+    obs_data_item_t* item = obs_data_item_byname(settings, key);
+    enum obs_data_type dtype = obs_data_item_gettype(item);
+    switch ((int)dtype) {
+        case OBS_DATA_NULL:
+            return "<null>";
+        case OBS_DATA_STRING:       
+            return obs_data_item_get_string(item);
+        case OBS_DATA_NUMBER:
+            if (obs_data_item_numtype(item) == OBS_DATA_NUM_INT) {
+                return std::to_string(obs_data_item_get_int(item));
+            } else {
+                return std::to_string(obs_data_item_get_double(item));
+            }
+        case OBS_DATA_BOOLEAN:
+            return std::to_string(obs_data_item_get_bool(item));
+        default:
+            return "<not support type>: " + std::to_string(dtype);
     }
 }
 // ========== 從子源克隆單一屬性 (帶前綴) ==========
 #define CHILD_PROP_PREFIX "child_"
+
 
 static void clone_property(obs_properties_t* dest_props, obs_property_t* src_prop) {
     const char* orig_name = obs_property_name(src_prop);
@@ -447,6 +510,7 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
     case OBS_PROPERTY_TEXT: {
         obs_text_type text_type = obs_property_text_type(src_prop);
         new_prop = obs_properties_add_text(dest_props, name, desc, text_type);
+        obs_property_text_set_info_type(new_prop, obs_property_text_info_type(src_prop));
         break;
     }
     
@@ -504,6 +568,7 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
     if (new_prop) {
         obs_property_set_visible(new_prop, obs_property_visible(src_prop));
         obs_property_set_enabled(new_prop, obs_property_enabled(src_prop));
+        obs_property_set_long_description(new_prop, obs_property_long_description(src_prop));
         
         // 對所有 child 屬性添加級聯刷新回調
         // 當任何 child 屬性變化時，更新子源並刷新屬性列表
@@ -519,11 +584,14 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
                 const char* old_prop_name = obs_property_name(p);
                 const char* new_prop_name = obs_property_name(p);
                 const char* real_child_key = old_prop_name + strlen("child_");
-                if(!obs_data_has_user_value(settings, real_child_key)) {
+                if(!obs_data_has_user_value(old_settings, real_child_key)) {
+                    //log property new settting value
+                    blog(LOG_INFO, "[Capture Preview] Property %s has no user value,new value=%s,skip refresh properties!", real_child_key, obs_data_get_any(settings, real_child_key));
                     return false;
                 }
                 
                 if (is_data_item_equal(old_settings, settings, real_child_key,new_prop_name)) {
+                    blog(LOG_INFO, "[Capture Preview] Property %s has no change,skip refresh properties!", real_child_key);
                     return false;
                 }
                 return update_child_and_refresh_props(props, settings, data);
