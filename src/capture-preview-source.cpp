@@ -600,8 +600,6 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
                 obs_data_t* old_settings = obs_source_get_settings(data->capture_source);
 
                 // 只有模式真正改變時才重建
-                //TODO: 考慮到首次初始化時是否有有效的settings可供比對，為何初始更新就會觸發這個modified，而創建新的好樣就不會
-                //TODO: 另外capture source的settings name mpaaing與上層nameing mapping不一樣，這裡要重新映射才行，要拿掉child_前綴
                 const char* old_prop_name = obs_property_name(p);
                 const char* new_prop_name = obs_property_name(p);
                 const char* real_child_key = old_prop_name + strlen("child_");
