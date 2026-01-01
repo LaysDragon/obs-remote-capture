@@ -94,6 +94,7 @@ static uint32_t capture_preview_get_height(void* data);
 static void ensure_capture_source_type(capture_preview_data* data, const char* source_type);
 static void audio_capture_callback(void* param, obs_source_t* source, 
                                     const struct audio_data* audio, bool muted);
+static void schedule_audio_active_sync(capture_preview_data* data);
 
 // 舊的 create_capture_source 已被 ensure_capture_source_type 取代
 
@@ -385,16 +386,9 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
         
         obs_source_update(data->capture_source, child_settings);
         obs_data_release(child_settings);
-        os_sleep_ms(1);
         
-        // 同步音頻活動狀態（設定更新後可能改變）
-        uint32_t child_flags = obs_source_get_output_flags(data->capture_source);
-        if (child_flags & OBS_SOURCE_AUDIO) {
-            bool audio_active = obs_source_audio_active(data->capture_source);
-            obs_source_set_audio_active(data->source, audio_active);
-            blog(LOG_INFO, "[Capture Preview] Update child source audio support: %s (audio_active=%d)", 
-                 obs_source_get_name(data->capture_source), audio_active);
-        }
+        // 延遲同步音頻活動狀態（設定更新後可能改變）
+        schedule_audio_active_sync(data);
     }
 }
 
@@ -626,6 +620,41 @@ static void clone_property(obs_properties_t* dest_props, obs_property_t* src_pro
     }
 }
 
+// ========== 延遲同步音頻活動狀態 ==========
+struct audio_sync_data {
+    obs_source_t* parent_source;
+    obs_source_t* child_source;
+};
+
+static void deferred_sync_audio_active(void* param) {
+    os_sleep_ms(10);
+    audio_sync_data* sync_data = (audio_sync_data*)param;
+    if (sync_data && sync_data->parent_source && sync_data->child_source) {
+        uint32_t child_flags = obs_source_get_output_flags(sync_data->child_source);
+        if (child_flags & OBS_SOURCE_AUDIO) {
+            bool audio_active = obs_source_audio_active(sync_data->child_source);
+            obs_source_set_audio_active(sync_data->parent_source, audio_active);
+            blog(LOG_INFO, "[Capture Preview] Deferred audio sync: parent=%s, child=%s, audio_active=%d",
+                 obs_source_get_name(sync_data->parent_source),
+                 obs_source_get_name(sync_data->child_source),
+                 audio_active);
+        }
+    }
+    delete sync_data;
+}
+
+// 包裝函數：排程延遲同步音頻活動狀態
+static void schedule_audio_active_sync(capture_preview_data* data) {
+    if (!data || !data->source || !data->capture_source) return;
+    
+    audio_sync_data* sync_data = new audio_sync_data();
+    sync_data->parent_source = data->source;
+    sync_data->child_source = data->capture_source;
+    
+    // 延遲到 UI 線程執行，避免同步問題
+    obs_queue_task(OBS_TASK_UI, deferred_sync_audio_active, sync_data, false);
+}
+
 // ========== 音頻捕獲回調 - 轉發子源音頻到父源 ==========
 static void audio_capture_callback(void* param, obs_source_t* source, 
                                     const struct audio_data* audio, bool muted) {
@@ -692,12 +721,10 @@ static void ensure_capture_source_type(capture_preview_data* data, const char* s
             // 註冊音頻捕獲回調
             obs_source_add_audio_capture_callback(data->capture_source, audio_capture_callback, data);
             
-            // 同步子源的音頻活動狀態到父源
-            bool audio_active = obs_source_audio_active(data->capture_source);
-            obs_source_set_audio_active(data->source, audio_active);
+            // 延遲同步子源的音頻活動狀態到父源
+            schedule_audio_active_sync(data);
             
-            blog(LOG_INFO, "[Capture Preview] Created child source with audio support: %s (audio_active=%d)", 
-                 source_type, audio_active);
+            blog(LOG_INFO, "[Capture Preview] Created child source with audio support: %s", source_type);
         } else {
             // 子源不支持音頻，禁用父源音頻
             obs_source_set_audio_active(data->source, false);
