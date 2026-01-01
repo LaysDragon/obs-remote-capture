@@ -92,6 +92,7 @@ static void capture_preview_video_tick(void* data, float seconds);
 static void capture_preview_video_render(void* data, gs_effect_t* effect);
 static uint32_t capture_preview_get_width(void* data);
 static uint32_t capture_preview_get_height(void* data);
+static void ensure_capture_source_type(capture_preview_data* data, int mode);
 
 // 舊的 create_capture_source 已被 ensure_capture_source_type 取代
 
@@ -359,7 +360,10 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     data->capture_mode = new_mode;
     data->delay_ms = new_delay;
     
-    // 如果子源存在，翻譯設定並傳遞給它
+    // 確保子源存在並且類型正確（處理 OBS 重啟後的初始化）
+    ensure_capture_source_type(data, new_mode);
+    
+    // 翻譯設定並傳遞給子源
     if (data->capture_source) {
         obs_data_t* child_settings = extract_child_settings(settings);
         
