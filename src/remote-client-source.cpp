@@ -15,6 +15,13 @@
 
 #include "grpc_client.h"
 
+#pragma warning(push)
+#pragma warning(disable: 4267)  // size_t to int conversion
+#include "remote_capture.pb.h"
+#pragma warning(pop)
+
+using namespace obsremote;
+
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -25,8 +32,8 @@
 #include <sstream>
 #include <map>
 
-// 視頻編解碼器
-#include "video_codec.h"
+// H.264 解碼器
+#include "codec_ffmpeg.h"
 
 // 捕捉模式常數
 #define CAPTURE_MODE_WINDOW 0
@@ -100,8 +107,8 @@ struct remote_source_data {
     };
     std::vector<CachedProperty> cached_props;
 
-    // 視頻解碼器緩存 (按 codec 類型)
-    std::map<VideoCodecType, std::unique_ptr<IVideoDecoder>> decoders;
+    // H.264 解碼器
+    std::unique_ptr<FFmpegDecoder> h264_decoder;
 
     remote_source_data() :
         source(nullptr),
@@ -216,7 +223,7 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
                                  const uint8_t* frame_data, size_t frame_size,
                                  uint32_t linesize,
                                  uint64_t timestamp_ns, void* user_data) {
-    UNUSED_PARAMETER(timestamp_ns);
+    UNUSED_PARAMETER(linesize);
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data) return;
     
@@ -224,47 +231,48 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
     static uint32_t callback_count = 0;
     callback_count++;
     
-    VideoCodecType codec_type = static_cast<VideoCodecType>(codec);
-    
-    // 獲取或創建解碼器
-    IVideoDecoder* decoder = nullptr;
-    auto it = data->decoders.find(codec_type);
-    if (it != data->decoders.end()) {
-        decoder = it->second.get();
-    } else {
-        // 創建新解碼器
-        auto new_decoder = createDecoder(codec_type);
-        if (new_decoder) {
-            blog(LOG_INFO, "[Remote Source] Created decoder: %s", new_decoder->getName());
-            decoder = new_decoder.get();
-            data->decoders[codec_type] = std::move(new_decoder);
-        }
-    }
-    
-    if (!decoder) {
+    // 只處理 H.264
+    if (codec != VideoCodec::CODEC_H264) {
         if (callback_count % 100 == 1) {
-            blog(LOG_WARNING, "[Remote Source] No decoder available for codec type %d", codec);
+            blog(LOG_WARNING, "[Remote Source] Unsupported codec: %d", codec);
         }
         return;
     }
     
+    // 確保解碼器存在
+    if (!data->h264_decoder) {
+        data->h264_decoder = std::make_unique<FFmpegDecoder>();
+        if (!data->h264_decoder->init()) {
+            blog(LOG_ERROR, "[Remote Source] Failed to create H.264 decoder");
+            data->h264_decoder.reset();
+            return;
+        }
+        blog(LOG_INFO, "[Remote Source] Created H.264 decoder: %s", 
+             data->h264_decoder->getName());
+    }
+    
     // 解碼
     std::vector<uint8_t> decoded;
-    if (decoder->decode(frame_data, frame_size, width, height, linesize, decoded)) {
+    if (data->h264_decoder->decode(frame_data, frame_size, width, height, decoded)) {
         std::lock_guard<std::mutex> lock(data->video_mutex);
         data->tex_width = width;
         data->tex_height = height;
         data->frame_buffer = std::move(decoded);
         data->frame_ready = true;
         
-        // 每 100 幀輸出一次解碼資訊
+        // 計算端對端延遲
+        uint64_t now = os_gettime_ns();
+        uint64_t latency_ms = (now - timestamp_ns) / 1000000;
+        
+        // 每 100 幀輸出一次
         if (callback_count % 100 == 1) {
-            blog(LOG_INFO, "[Remote Source] Decoded frame #%u: %ux%u, codec=%s, input=%zu, output=%zu",
-                 callback_count, width, height, decoder->getName(), 
-                 frame_size, data->frame_buffer.size());
+            blog(LOG_INFO, "[Remote Source] H.264 frame #%u: %ux%u, size=%zu, latency=%llu ms",
+                 callback_count, width, height, frame_size, (unsigned long long)latency_ms);
         }
     } else {
-        blog(LOG_WARNING, "[Remote Source] Decoder failed for frame #%u", callback_count);
+        if (callback_count % 100 == 1) {
+            blog(LOG_WARNING, "[Remote Source] H.264 decode failed for frame #%u", callback_count);
+        }
     }
 }
 
@@ -380,8 +388,8 @@ static void remote_source_destroy(void* data_ptr) {
     }
     obs_leave_graphics();
 
-    // 解碼器由 map 自動清理
-    data->decoders.clear();
+    // 清理 H.264 解碼器
+    data->h264_decoder.reset();
 
     delete data;
 }

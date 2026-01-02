@@ -4,6 +4,16 @@
     "version": "1.0.0",
     "dependencies": [
         "grpc",
-        "protobuf"
+        "protobuf",
+        {
+            "name": "ffmpeg",
+            "features": [
+                "nvcodec",
+                "x264",
+                "qsv",
+                "amf"
+            ],
+            "default-features": false
+        }
     ]
 }

@@ -49,28 +49,32 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin-main.c
   src/remote-client-source.cpp
   src/capture-preview-source.cpp
-  src/video_codec.cpp
-  src/codec_raw.cpp
-  src/codec_jpeg.cpp
+  src/codec_ffmpeg.cpp
   src/flow_meter.cpp
 )
 
-# ========== Windows 網路庫 ==========
+# ========== Windows 系統庫 ==========
 if(WIN32)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
 endif()
 
-# ========== TurboJPEG (可選) ==========
-find_path(TURBOJPEG_INCLUDE_DIR turbojpeg.h)
-find_library(TURBOJPEG_LIBRARY turbojpeg)
-
-if(TURBOJPEG_INCLUDE_DIR AND TURBOJPEG_LIBRARY)
-  message(STATUS "Found TurboJPEG: ${TURBOJPEG_LIBRARY}")
-  target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${TURBOJPEG_INCLUDE_DIR})
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${TURBOJPEG_LIBRARY})
-  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_TURBOJPEG)
+# ========== FFmpeg (H.264 硬體編解碼) ==========
+find_package(FFmpeg COMPONENTS avcodec avutil swscale)
+if(FFmpeg_FOUND)
+  message(STATUS "Found FFmpeg: avcodec=${FFmpeg_avcodec_VERSION}")
+  
+  # 使用 include dirs 和 libraries (避免 target 的依賴問題)
+  target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARY_DIRS})
+  
+  # 過濾並手動連結 FFmpeg 庫
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
+    avcodec
+    avutil
+    swscale
+  )
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_FFMPEG)
 else()
-  message(WARNING "TurboJPEG not found - video encoding will be disabled")
+  message(WARNING "FFmpeg not found - H.264 encoding will be disabled")
 endif()
 
 # ========== gRPC 與 Protobuf (可選) ==========

@@ -1,0 +1,315 @@
+/*
+ * codec_ffmpeg.cpp
+ * FFmpeg H.264 硬體編解碼器實現
+ */
+
+#include "codec_ffmpeg.h"
+#include <obs-module.h>
+#include <cstring>
+
+#ifdef HAVE_FFMPEG
+
+// ========== 編碼器實現 ==========
+
+FFmpegEncoder::FFmpegEncoder() = default;
+
+FFmpegEncoder::~FFmpegEncoder() {
+    reset();
+}
+
+void FFmpegEncoder::reset() {
+    if (sws_) {
+        sws_freeContext(sws_);
+        sws_ = nullptr;
+    }
+    if (pkt_) {
+        av_packet_free(&pkt_);
+    }
+    if (frame_) {
+        av_frame_free(&frame_);
+    }
+    if (ctx_) {
+        avcodec_free_context(&ctx_);
+    }
+    extra_data_.clear();
+    width_ = height_ = 0;
+    pts_ = 0;
+}
+
+bool FFmpegEncoder::initEncoder(const char* encoder_name) {
+    const AVCodec* codec = avcodec_find_encoder_by_name(encoder_name);
+    if (!codec) {
+        return false;
+    }
+    
+    ctx_ = avcodec_alloc_context3(codec);
+    if (!ctx_) {
+        return false;
+    }
+    
+    ctx_->width = width_;
+    ctx_->height = height_;
+    ctx_->time_base = {1, 1000};  // 毫秒為單位
+    ctx_->framerate = {30, 1};
+    ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx_->bit_rate = 8000000;  // 8 Mbps
+    ctx_->gop_size = 30;  // 每 30 幀一個 keyframe
+    ctx_->max_b_frames = 0;  // 禁用 B-frame 減少延遲
+    
+    // 低延遲設定
+    av_opt_set(ctx_->priv_data, "tune", "zerolatency", 0);
+    av_opt_set(ctx_->priv_data, "preset", "fast", 0);
+    
+    // NVENC 特定設定
+    if (strstr(encoder_name, "nvenc")) {
+        av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+        av_opt_set(ctx_->priv_data, "delay", "0", 0);
+        av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
+    }
+    
+    if (avcodec_open2(ctx_, codec, nullptr) < 0) {
+        avcodec_free_context(&ctx_);
+        return false;
+    }
+    
+    // 保存 SPS/PPS
+    if (ctx_->extradata && ctx_->extradata_size > 0) {
+        extra_data_.assign(ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
+    }
+    
+    encoder_name_ = encoder_name;
+    return true;
+}
+
+bool FFmpegEncoder::init(uint32_t width, uint32_t height, int fps, int bitrate_kbps) {
+    reset();
+    
+    width_ = width;
+    height_ = height;
+    
+    // 嘗試各種編碼器
+    const char* encoders[] = {
+        "h264_nvenc",   // NVIDIA
+        "h264_qsv",     // Intel
+        "h264_amf",     // AMD
+        "libx264",      // 軟體 fallback
+        nullptr
+    };
+    
+    for (int i = 0; encoders[i]; i++) {
+        if (initEncoder(encoders[i])) {
+            blog(LOG_INFO, "[FFmpeg] Using encoder: %s", encoders[i]);
+            
+            // 分配 frame 和 packet
+            frame_ = av_frame_alloc();
+            frame_->format = AV_PIX_FMT_YUV420P;
+            frame_->width = width;
+            frame_->height = height;
+            av_frame_get_buffer(frame_, 0);
+            
+            pkt_ = av_packet_alloc();
+            
+            // 創建 BGRA → YUV420P 轉換器
+            sws_ = sws_getContext(
+                width, height, AV_PIX_FMT_BGRA,
+                width, height, AV_PIX_FMT_YUV420P,
+                SWS_BILINEAR, nullptr, nullptr, nullptr
+            );
+            
+            return true;
+        }
+    }
+    
+    blog(LOG_ERROR, "[FFmpeg] No H.264 encoder available!");
+    return false;
+}
+
+bool FFmpegEncoder::encode(const uint8_t* bgra_data, uint32_t width, uint32_t height,
+                            uint32_t linesize, std::vector<uint8_t>& out_data,
+                            bool& is_keyframe) {
+    if (!ctx_ || !frame_ || !pkt_ || !sws_) {
+        return false;
+    }
+    
+    // 檢查尺寸變化
+    if (width != width_ || height != height_) {
+        init(width, height);
+        if (!ctx_) return false;
+    }
+    
+    // BGRA → YUV420P
+    const uint8_t* src[] = { bgra_data };
+    int src_linesize[] = { (int)linesize };
+    
+    sws_scale(sws_, src, src_linesize, 0, height,
+              frame_->data, frame_->linesize);
+    
+    frame_->pts = pts_++;
+    
+    // 編碼
+    int ret = avcodec_send_frame(ctx_, frame_);
+    if (ret < 0) {
+        return false;
+    }
+    
+    ret = avcodec_receive_packet(ctx_, pkt_);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return false;
+    }
+    if (ret < 0) {
+        return false;
+    }
+    
+    // 輸出
+    out_data.assign(pkt_->data, pkt_->data + pkt_->size);
+    is_keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
+    
+    av_packet_unref(pkt_);
+    return true;
+}
+
+const char* FFmpegEncoder::getName() const {
+    return encoder_name_.empty() ? "Unknown" : encoder_name_.c_str();
+}
+
+// ========== 解碼器實現 ==========
+
+FFmpegDecoder::FFmpegDecoder() = default;
+
+FFmpegDecoder::~FFmpegDecoder() {
+    reset();
+}
+
+void FFmpegDecoder::reset() {
+    if (sws_) {
+        sws_freeContext(sws_);
+        sws_ = nullptr;
+    }
+    if (pkt_) {
+        av_packet_free(&pkt_);
+    }
+    if (frame_) {
+        av_frame_free(&frame_);
+    }
+    if (ctx_) {
+        avcodec_free_context(&ctx_);
+    }
+    last_width_ = last_height_ = 0;
+}
+
+bool FFmpegDecoder::init(const uint8_t* extra_data, size_t extra_size) {
+    reset();
+    
+    // 使用軟體解碼器 (通常足夠快)
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        blog(LOG_ERROR, "[FFmpeg] H.264 decoder not found");
+        return false;
+    }
+    
+    ctx_ = avcodec_alloc_context3(codec);
+    if (!ctx_) {
+        return false;
+    }
+    
+    // 設置 extradata (SPS/PPS)
+    if (extra_data && extra_size > 0) {
+        ctx_->extradata = (uint8_t*)av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        memcpy(ctx_->extradata, extra_data, extra_size);
+        ctx_->extradata_size = (int)extra_size;
+    }
+    
+    // 低延遲設定
+    ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
+    
+    if (avcodec_open2(ctx_, codec, nullptr) < 0) {
+        avcodec_free_context(&ctx_);
+        return false;
+    }
+    
+    frame_ = av_frame_alloc();
+    pkt_ = av_packet_alloc();
+    
+    decoder_name_ = codec->name;
+    blog(LOG_INFO, "[FFmpeg] Using decoder: %s", codec->name);
+    
+    return true;
+}
+
+bool FFmpegDecoder::decode(const uint8_t* h264_data, size_t size,
+                            uint32_t expected_width, uint32_t expected_height,
+                            std::vector<uint8_t>& out_bgra) {
+    if (!ctx_ || !frame_ || !pkt_) {
+        // 自動初始化
+        if (!init()) {
+            return false;
+        }
+    }
+    
+    pkt_->data = const_cast<uint8_t*>(h264_data);
+    pkt_->size = (int)size;
+    
+    int ret = avcodec_send_packet(ctx_, pkt_);
+    if (ret < 0) {
+        return false;
+    }
+    
+    ret = avcodec_receive_frame(ctx_, frame_);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return false;
+    }
+    if (ret < 0) {
+        return false;
+    }
+    
+    uint32_t w = frame_->width;
+    uint32_t h = frame_->height;
+    
+    // 重新創建 SWS (尺寸變化時)
+    if (w != last_width_ || h != last_height_) {
+        if (sws_) sws_freeContext(sws_);
+        sws_ = sws_getContext(
+            w, h, (AVPixelFormat)frame_->format,
+            w, h, AV_PIX_FMT_BGRA,
+            SWS_BILINEAR, nullptr, nullptr, nullptr
+        );
+        last_width_ = w;
+        last_height_ = h;
+    }
+    
+    // YUV → BGRA
+    out_bgra.resize(w * h * 4);
+    uint8_t* dst[] = { out_bgra.data() };
+    int dst_linesize[] = { (int)(w * 4) };
+    
+    sws_scale(sws_, frame_->data, frame_->linesize, 0, h,
+              dst, dst_linesize);
+    
+    return true;
+}
+
+const char* FFmpegDecoder::getName() const {
+    return decoder_name_.empty() ? "Unknown" : decoder_name_.c_str();
+}
+
+#else  // !HAVE_FFMPEG
+
+// 無 FFmpeg 的 stub 實現
+FFmpegEncoder::FFmpegEncoder() = default;
+FFmpegEncoder::~FFmpegEncoder() = default;
+void FFmpegEncoder::reset() {}
+bool FFmpegEncoder::init(uint32_t, uint32_t, int, int) { return false; }
+bool FFmpegEncoder::encode(const uint8_t*, uint32_t, uint32_t, uint32_t, 
+                            std::vector<uint8_t>&, bool&) { return false; }
+const char* FFmpegEncoder::getName() const { return "Unavailable"; }
+
+FFmpegDecoder::FFmpegDecoder() = default;
+FFmpegDecoder::~FFmpegDecoder() = default;
+void FFmpegDecoder::reset() {}
+bool FFmpegDecoder::init(const uint8_t*, size_t) { return false; }
+bool FFmpegDecoder::decode(const uint8_t*, size_t, uint32_t, uint32_t, 
+                            std::vector<uint8_t>&) { return false; }
+const char* FFmpegDecoder::getName() const { return "Unavailable"; }
+
+#endif  // HAVE_FFMPEG

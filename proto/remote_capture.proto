@@ -81,6 +81,10 @@ message VideoFrame {
   uint64 timestamp_ns = 5;
   uint32 frame_number = 6;
   uint32 linesize = 7;       // Raw 格式時的行寬 (bytes per row)
+  
+  // H.264 specific
+  bool is_keyframe = 10;     // 是否為關鍵幀 (I-frame)
+  bytes sps_pps = 11;        // SPS/PPS 參數集 (隨 keyframe 發送)
 }
 
 // 音頻幀

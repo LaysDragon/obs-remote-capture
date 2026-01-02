@@ -35,7 +35,7 @@
 #include <memory>
 #include <queue>
 
-#include "video_codec.h"
+#include "codec_ffmpeg.h"
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -65,8 +65,8 @@ struct GrpcStreamSession {
     uint32_t height = 0;
     uint32_t frame_number = 0;
     
-    // 視頻編碼器
-    std::unique_ptr<IVideoEncoder> encoder;
+    // H.264 編碼器
+    std::unique_ptr<FFmpegEncoder> encoder;
 
     // 音頻隊列
     std::queue<AudioFrame> audio_queue;
@@ -156,6 +156,16 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
              (void*)session->texrender, (void*)session->stagesurface);
         
         obs_leave_graphics();
+        
+        // 初始化/重新初始化 H.264 編碼器
+        if (session->encoder) {
+            if (session->encoder->init(width, height)) {
+                blog(LOG_INFO, "[gRPC Server] H.264 encoder initialized: %s (%ux%u)",
+                     session->encoder->getName(), width, height);
+            } else {
+                blog(LOG_ERROR, "[gRPC Server] Failed to init H.264 encoder");
+            }
+        }
     }
     
     if (!session->texrender || !session->stagesurface) {
@@ -191,30 +201,37 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
         uint8_t* data;
         uint32_t linesize;
         if (gs_stagesurface_map(session->stagesurface, &data, &linesize)) {
-            // 使用編碼器壓縮
+            // 使用 FFmpeg H.264 編碼器
             if (session->encoder) {
                 std::vector<uint8_t> encoded_data;
-                uint32_t out_linesize = 0;
+                bool is_keyframe = false;
                 
                 if (session->encoder->encode(data, width, height, linesize, 
-                                              encoded_data, out_linesize)) {
+                                              encoded_data, is_keyframe)) {
                     out_frame->set_width(width);
                     out_frame->set_height(height);
-                    out_frame->set_codec(static_cast<VideoCodec>(session->encoder->getCodecType()));
+                    out_frame->set_codec(VideoCodec::CODEC_H264);
                     out_frame->set_frame_data(encoded_data.data(), encoded_data.size());
                     out_frame->set_timestamp_ns(os_gettime_ns());
                     out_frame->set_frame_number(session->frame_number++);
-                    out_frame->set_linesize(out_linesize);
+                    out_frame->set_is_keyframe(is_keyframe);
+                    
+                    // 發送 SPS/PPS (keyframe 時)
+                    if (is_keyframe && !session->encoder->getExtraData().empty()) {
+                        const auto& extra = session->encoder->getExtraData();
+                        out_frame->set_sps_pps(extra.data(), extra.size());
+                    }
+                    
                     success = true;
                     
                     // 每 100 幀輸出一次壓縮資訊
                     if (session->frame_number % 100 == 0) {
-                        blog(LOG_INFO, "[gRPC Server] Encoded frame=%u, codec=%s, size=%zu bytes",
+                        blog(LOG_INFO, "[gRPC Server] H.264 frame=%u, encoder=%s, size=%zu, keyframe=%d",
                              session->frame_number, session->encoder->getName(), 
-                             encoded_data.size());
+                             encoded_data.size(), is_keyframe);
                     }
                 } else {
-                    blog(LOG_WARNING, "[gRPC Server] Encoder failed");
+                    blog(LOG_WARNING, "[gRPC Server] H.264 encode failed");
                 }
             } else {
                 blog(LOG_WARNING, "[gRPC Server] No encoder available");
@@ -351,13 +368,9 @@ public:
         session.active.store(true);
         session.writer = writer;
         
-        // 創建視頻編碼器
-        session.encoder = createDefaultEncoder();
-        if (!session.encoder) {
-            obs_source_release(capture_source);
-            return Status(grpc::StatusCode::INTERNAL, "Failed to create video encoder");
-        }
-        blog(LOG_INFO, "[gRPC Server] Using encoder: %s", session.encoder->getName());
+        // 創建 H.264 編碼器 (會在第一幀時初始化)
+        session.encoder = std::make_unique<FFmpegEncoder>();
+        blog(LOG_INFO, "[gRPC Server] FFmpeg encoder created (init on first frame)");
         
         // 激活源
         obs_source_inc_showing(capture_source);
