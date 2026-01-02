@@ -182,12 +182,14 @@ bool FFmpegEncoder::encode(const uint8_t* bgra_data, uint32_t width, uint32_t he
     if (!ctx_ || !frame_ || !pkt_ || !sws_) {
         return false;
     }
-    
+
+        
     // 檢查尺寸變化
     if (width != width_ || height != height_) {
         init(width, height);
         if (!ctx_) return false;
     }
+
     
     // BGRA → YUV420P
     const uint8_t* src[] = { bgra_data };
@@ -284,7 +286,11 @@ bool FFmpegDecoder::init() {
 
 bool FFmpegDecoder::decode(const uint8_t* h264_data, size_t size,
                             uint32_t expected_width, uint32_t expected_height,
-                            std::vector<uint8_t>& out_bgra) {
+                            std::vector<uint8_t>& out_bgra,
+                            uint32_t& out_width, uint32_t& out_height) {
+    UNUSED_PARAMETER(expected_width);
+    UNUSED_PARAMETER(expected_height);
+    
     if (!ctx_ || !frame_ || !pkt_) {
         // 自動初始化
         if (!init()) {
@@ -310,6 +316,10 @@ bool FFmpegDecoder::decode(const uint8_t* h264_data, size_t size,
     
     uint32_t w = frame_->width;
     uint32_t h = frame_->height;
+    
+    // 返回實際解碼尺寸
+    out_width = w;
+    out_height = h;
     
     // 重新創建 SWS (尺寸變化時)
     if (w != last_width_ || h != last_height_) {

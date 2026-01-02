@@ -261,10 +261,12 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
     
     // 解碼
     std::vector<uint8_t> decoded;
-    if (data->h264_decoder->decode(frame_data, frame_size, width, height, decoded)) {
+    uint32_t decoded_width = 0, decoded_height = 0;
+    if (data->h264_decoder->decode(frame_data, frame_size, width, height, decoded, decoded_width, decoded_height)) {
         std::lock_guard<std::mutex> lock(data->video_mutex);
-        data->tex_width = width;
-        data->tex_height = height;
+        // 使用實際解碼的尺寸，而非 gRPC 訊息中的尺寸
+        data->tex_width = decoded_width;
+        data->tex_height = decoded_height;
         data->frame_buffer = std::move(decoded);
         data->frame_ready = true;
         
@@ -274,8 +276,8 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
         
         // 每 100 幀輸出一次
         if (callback_count % 100 == 1) {
-            blog(LOG_INFO, "[Remote Source] H.264 frame #%u: %ux%u, size=%zu, latency=%llu ms",
-                 callback_count, width, height, frame_size, (unsigned long long)latency_ms);
+            blog(LOG_INFO, "[Remote Source] H.264 frame #%u: %ux%u (decoded: %ux%u), size=%zu, latency=%llu ms",
+                 callback_count, width, height, decoded_width, decoded_height, frame_size, (unsigned long long)latency_ms);
         }
     } else {
         if (callback_count % 100 == 1) {
@@ -452,6 +454,19 @@ static void remote_source_video_render(void* data_ptr, gs_effect_t* effect) {
     {
         std::lock_guard<std::mutex> lock(data->video_mutex);
         if (data->frame_ready && !data->frame_buffer.empty()) {
+            // 驗證 frame_buffer 大小與期望尺寸匹配
+            size_t expected_size = (size_t)data->tex_width * data->tex_height * 4;
+            if (data->frame_buffer.size() != expected_size) {
+                // 尺寸不匹配，跳過這一幀
+                static uint32_t mismatch_count = 0;
+                if (++mismatch_count % 30 == 1) {
+                    blog(LOG_WARNING, "[Remote Source] Frame size mismatch: buffer=%zu, expected=%zu (%ux%u)",
+                         data->frame_buffer.size(), expected_size, data->tex_width, data->tex_height);
+                }
+                data->frame_ready = false;
+                return;
+            }
+            
             if (!data->texture ||
                 data->tex_width != gs_texture_get_width(data->texture) ||
                 data->tex_height != gs_texture_get_height(data->texture)) {

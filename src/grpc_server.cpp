@@ -34,6 +34,7 @@
 #include <mutex>
 #include <memory>
 #include <queue>
+#include <chrono>
 
 #include "codec_ffmpeg.h"
 
@@ -67,6 +68,12 @@ struct GrpcStreamSession {
     
     // H.264 編碼器
     std::unique_ptr<FFmpegEncoder> encoder;
+    
+    // 尺寸變化防抖
+    uint32_t pending_width = 0;
+    uint32_t pending_height = 0;
+    std::chrono::steady_clock::time_point resize_time{};
+    static constexpr int RESIZE_DEBOUNCE_MS = 300;  // 等待 300ms 穩定
 
     // 音頻隊列
     std::queue<AudioFrame> audio_queue;
@@ -137,10 +144,31 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
         return false;
     }
     
-    // 重新創建渲染資源 (尺寸變化時)
+    // 尺寸變化處理（帶防抖）
     if (width != session->width || height != session->height) {
-        blog(LOG_INFO, "[gRPC Server] Recreating render resources: %ux%u -> %ux%u",
-             session->width, session->height, width, height);
+        auto now = std::chrono::steady_clock::now();
+        
+        // 記錄新的 pending 尺寸
+        if (width != session->pending_width || height != session->pending_height) {
+            session->pending_width = width;
+            session->pending_height = height;
+            session->resize_time = now;
+            blog(LOG_INFO, "[gRPC Server] Resize pending: %ux%u -> %ux%u",
+                 session->width, session->height, width, height);
+        }
+        
+        // 檢查是否已等待足夠時間
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - session->resize_time).count();
+        
+        if (elapsed < GrpcStreamSession::RESIZE_DEBOUNCE_MS) {
+            // 尺寸還在變化，跳過這一幀
+            return false;
+        }
+        
+        // 尺寸穩定，重新創建資源
+        blog(LOG_INFO, "[gRPC Server] Resize stable for %lldms, recreating resources: %ux%u",
+             elapsed, session->pending_width, session->pending_height);
         
         obs_enter_graphics();
         
@@ -148,9 +176,9 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
         if (session->stagesurface) gs_stagesurface_destroy(session->stagesurface);
         
         session->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-        session->stagesurface = gs_stagesurface_create(width, height, GS_BGRA);
-        session->width = width;
-        session->height = height;
+        session->stagesurface = gs_stagesurface_create(session->pending_width, session->pending_height, GS_BGRA);
+        session->width = session->pending_width;
+        session->height = session->pending_height;
         
         blog(LOG_INFO, "[gRPC Server] Created texrender=%p, stagesurface=%p",
              (void*)session->texrender, (void*)session->stagesurface);
@@ -159,9 +187,9 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
         
         // 初始化/重新初始化 H.264 編碼器
         if (session->encoder) {
-            if (session->encoder->init(width, height)) {
+            if (session->encoder->init(session->width, session->height)) {
                 blog(LOG_INFO, "[gRPC Server] H.264 encoder initialized: %s (%ux%u)",
-                     session->encoder->getName(), width, height);
+                     session->encoder->getName(), session->width, session->height);
             } else {
                 blog(LOG_ERROR, "[gRPC Server] Failed to init H.264 encoder");
             }

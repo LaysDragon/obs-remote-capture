@@ -59,7 +59,6 @@ private:
     uint32_t height_ = 0;
     int64_t pts_ = 0;
     
-
     std::string encoder_name_;
 };
 
@@ -73,9 +72,11 @@ public:
     bool init();
     
     // 解碼 H.264 數據到 BGRA
+    // out_width/out_height 返回實際解碼的尺寸（可能與 expected 不同，因為 H.264 對齊）
     bool decode(const uint8_t* h264_data, size_t size,
                 uint32_t expected_width, uint32_t expected_height,
-                std::vector<uint8_t>& out_bgra);
+                std::vector<uint8_t>& out_bgra,
+                uint32_t& out_width, uint32_t& out_height);
     
     // 獲取解碼器名稱
     const char* getName() const;
