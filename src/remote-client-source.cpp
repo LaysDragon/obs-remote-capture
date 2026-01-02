@@ -51,7 +51,7 @@ struct remote_source_data {
     bool audio_capture;
 
     // gRPC 客戶端
-    grpc_client_t grpc_client;
+    std::unique_ptr<GrpcClient> grpc_client;
     std::atomic<bool> connected;
     std::atomic<bool> streaming;
 
@@ -111,7 +111,6 @@ struct remote_source_data {
         server_port(DEFAULT_SERVER_PORT),
         capture_mode(CAPTURE_MODE_WINDOW),
         audio_capture(false),
-        grpc_client(nullptr),
         connected(false),
         streaming(false),
         texture(nullptr),
@@ -129,26 +128,18 @@ static bool connect_to_server(remote_source_data* data) {
     if (data->connected.load()) return true;
     if (data->server_ip.empty()) return false;
 
-    // gRPC 模式：創建客戶端並連接
-    if (data->grpc_client) {
-        grpc_client_destroy(data->grpc_client);
-    }
+    // 創建 gRPC 客戶端並連接
+    std::string address = data->server_ip + ":" + std::to_string(data->server_port);
+    data->grpc_client = std::make_unique<GrpcClient>(address);
     
-    char address[256];
-    snprintf(address, sizeof(address), "%s:%d", data->server_ip.c_str(), data->server_port);
-    data->grpc_client = grpc_client_create(address);
-    
-    if (data->grpc_client && grpc_client_wait_connected(data->grpc_client, 5000)) {
+    if (data->grpc_client && data->grpc_client->waitForConnected(5000)) {
         data->connected.store(true);
-        blog(LOG_INFO, "[Remote Source] gRPC connected to %s", address);
+        blog(LOG_INFO, "[Remote Source] gRPC connected to %s", address.c_str());
         return true;
     }
     
-    blog(LOG_WARNING, "[Remote Source] gRPC failed to connect to %s", address);
-    if (data->grpc_client) {
-        grpc_client_destroy(data->grpc_client);
-        data->grpc_client = nullptr;
-    }
+    blog(LOG_WARNING, "[Remote Source] gRPC failed to connect to %s", address.c_str());
+    data->grpc_client.reset();
     return false;
 }
 
@@ -157,9 +148,8 @@ static void disconnect_from_server(remote_source_data* data) {
     data->connected.store(false);
 
     if (data->grpc_client) {
-        grpc_client_stop_stream(data->grpc_client);
-        grpc_client_destroy(data->grpc_client);
-        data->grpc_client = nullptr;
+        data->grpc_client->stopStream();
+        data->grpc_client.reset();
     }
 }
 
@@ -174,19 +164,18 @@ static bool request_properties(remote_source_data* data) {
         stop_streaming(data);
     }
     
-    // 斷開現有連接以確保乾淨的 socket 狀態
+    // 斷開現有連接以確保乾淨的狀態
     if (data->connected.load()) {
         disconnect_from_server(data);
     }
     
     if (!connect_to_server(data)) return false;
 
-
-    // gRPC 模式：使用 gRPC 客戶端獲取屬性
-    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
+    // 使用 gRPC 客戶端獲取屬性
+    std::string source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
         ? "game_capture" : "window_capture";
     
-    if (!grpc_client_get_properties(data->grpc_client, source_type)) {
+    if (!data->grpc_client->getProperties(source_type)) {
         blog(LOG_WARNING, "[Remote Source] gRPC GetProperties failed");
         return false;
     }
@@ -197,31 +186,22 @@ static bool request_properties(remote_source_data* data) {
         data->cached_props.clear();
         data->window_list.clear();
         
-        size_t count = grpc_client_property_count(data->grpc_client);
-        for (size_t i = 0; i < count; i++) {
+        const auto& properties = data->grpc_client->getCachedProperties();
+        for (const auto& grpc_prop : properties) {
             remote_source_data::CachedProperty prop;
-            prop.name = grpc_client_property_name(data->grpc_client, i);
-            prop.description = grpc_client_property_description(data->grpc_client, i);
-            prop.type = grpc_client_property_type(data->grpc_client, i);
+            prop.name = grpc_prop.name;
+            prop.description = grpc_prop.description;
+            prop.type = grpc_prop.type;
             prop.visible = true;
             
             // 處理 LIST 類型
             if (prop.type == 6) {  // OBS_PROPERTY_LIST
-                size_t item_count = grpc_client_property_item_count(data->grpc_client, i);
-                for (size_t j = 0; j < item_count; j++) {
-                    const char* item_name = grpc_client_property_item_name(data->grpc_client, i, j);
-                    const char* item_value = grpc_client_property_item_value(data->grpc_client, i, j);
-                    prop.items.push_back({
-                        item_name ? item_name : "",
-                        item_value ? item_value : ""
-                    });
+                for (const auto& item : grpc_prop.items) {
+                    prop.items.push_back({item.name, item.value});
                     
                     // 填充視窗列表 (如果是 window 屬性)
                     if (prop.name == "window") {
-                        data->window_list.push_back({
-                            item_name ? item_name : "",
-                            item_value ? item_value : ""
-                        });
+                        data->window_list.push_back({item.name, item.value});
                     }
                 }
             }
@@ -303,19 +283,26 @@ static void start_streaming(remote_source_data* data) {
 
     blog(LOG_INFO, "[Remote Source] Starting stream with window: %s", data->selected_window.c_str());
 
-    // gRPC 模式：使用 gRPC 客戶端開始串流
-    const char* source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
+    // 使用 gRPC 客戶端開始串流
+    std::string source_type = (data->capture_mode == CAPTURE_MODE_GAME) 
         ? "game_capture" : "window_capture";
     
     // 構建設定
-    const char* keys[] = {"window"};
-    const char* values[] = {data->selected_window.c_str()};
+    std::map<std::string, std::string> settings;
+    settings["window"] = data->selected_window;
     
     data->streaming.store(true);
     
-    if (!grpc_client_start_stream(data->grpc_client, source_type,
-            keys, values, 1,
-            grpc_video_callback, grpc_audio_callback, data)) {
+    // 使用 lambda 捕獲 data 指針來調用回調
+    remote_source_data* capture_data = data;
+    
+    if (!data->grpc_client->startStream(source_type, settings,
+            [capture_data](uint32_t w, uint32_t h, const uint8_t* d, size_t s, uint64_t t) {
+                grpc_video_callback(w, h, d, s, t, capture_data);
+            },
+            [capture_data](uint32_t sr, uint32_t ch, const float* d, size_t s, uint64_t t) {
+                grpc_audio_callback(sr, ch, d, s, t, capture_data);
+            })) {
         blog(LOG_WARNING, "[Remote Source] gRPC StartStream failed");
         data->streaming.store(false);
     } else {
@@ -331,9 +318,9 @@ static void stop_streaming(remote_source_data* data) {
     // 先標記停止
     data->streaming.store(false);
 
-    // gRPC 模式
+    // 停止 gRPC 串流
     if (data->grpc_client) {
-        grpc_client_stop_stream(data->grpc_client);
+        data->grpc_client->stopStream();
     }
 
     blog(LOG_INFO, "[Remote Source] Stream stopped");

@@ -10,6 +10,8 @@
 
 #ifdef HAVE_GRPC
 
+#include "grpc_client.h"
+
 #include <obs-module.h>
 #include <util/platform.h>
 
@@ -27,37 +29,23 @@
 #pragma warning(pop)
 #endif
 
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <memory>
-#include <functional>
-#include <queue>
-
 using grpc::Channel;
 using grpc::ClientContext;
 using grpc::ClientReader;
 using grpc::Status;
 using namespace obsremote;
 
-// ========== 客戶端類 ==========
-class GrpcClient {
+// ========== PIMPL 實現類 ==========
+class GrpcClient::Impl {
 public:
-    using VideoCallback = std::function<void(uint32_t width, uint32_t height, 
-                                              const uint8_t* jpeg_data, size_t jpeg_size,
-                                              uint64_t timestamp_ns)>;
-    using AudioCallback = std::function<void(uint32_t sample_rate, uint32_t channels,
-                                              const float* pcm_data, size_t samples,
-                                              uint64_t timestamp_ns)>;
-
-    GrpcClient(const std::string& server_address) 
+    Impl(const std::string& server_address) 
         : channel_(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials())),
           stub_(RemoteCaptureService::NewStub(channel_)),
           streaming_(false) {
         blog(LOG_INFO, "[gRPC Client] Created client for %s", server_address.c_str());
     }
     
-    ~GrpcClient() {
+    ~Impl() {
         StopStream();
     }
     
@@ -67,14 +55,13 @@ public:
         return state == GRPC_CHANNEL_READY || state == GRPC_CHANNEL_IDLE;
     }
     
-    bool WaitForConnected(int timeout_ms = 5000) {
+    bool WaitForConnected(int timeout_ms) {
         auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms);
         return channel_->WaitForConnected(deadline);
     }
     
     // 獲取屬性列表
-    bool GetProperties(const std::string& source_type, 
-                       std::vector<Property>& out_properties) {
+    bool GetProperties(const std::string& source_type, std::vector<GrpcClient::Property>& out) {
         GetPropertiesRequest request;
         request.set_source_type(source_type);
         
@@ -90,20 +77,30 @@ public:
             return false;
         }
         
-        out_properties.clear();
+        out.clear();
         for (const auto& prop : response.properties()) {
-            out_properties.push_back(prop);
+            GrpcClient::Property p;
+            p.name = prop.name();
+            p.description = prop.description();
+            p.type = prop.type();
+            p.visible = prop.visible();
+            
+            for (const auto& item : prop.items()) {
+                p.items.push_back({item.name(), item.value()});
+            }
+            
+            out.push_back(std::move(p));
         }
         
-        blog(LOG_INFO, "[gRPC Client] Got %zu properties", out_properties.size());
+        blog(LOG_INFO, "[gRPC Client] Got %zu properties", out.size());
         return true;
     }
     
     // 開始接收串流
     bool StartStream(const std::string& source_type,
                      const std::map<std::string, std::string>& settings,
-                     VideoCallback on_video,
-                     AudioCallback on_audio) {
+                     GrpcClient::VideoCallback on_video,
+                     GrpcClient::AudioCallback on_audio) {
         if (streaming_.load()) {
             StopStream();
         }
@@ -186,143 +183,43 @@ private:
     std::atomic<bool> streaming_;
     std::thread stream_thread_;
     std::unique_ptr<ClientContext> stream_context_;
-    VideoCallback on_video_;
-    AudioCallback on_audio_;
+    GrpcClient::VideoCallback on_video_;
+    GrpcClient::AudioCallback on_audio_;
 };
 
-// ========== C API 包裝器 ==========
+// ========== GrpcClient 公開接口實現 ==========
 
-struct grpc_client_handle {
-    std::unique_ptr<GrpcClient> client;
-    std::vector<Property> cached_properties;
-};
-
-extern "C" {
-
-typedef struct grpc_client_handle* grpc_client_t;
-
-grpc_client_t grpc_client_create(const char* server_address) {
-    auto* handle = new grpc_client_handle();
-    handle->client = std::make_unique<GrpcClient>(server_address);
-    return handle;
+GrpcClient::GrpcClient(const std::string& server_address)
+    : impl_(std::make_unique<Impl>(server_address)) {
 }
 
-void grpc_client_destroy(grpc_client_t client) {
-    if (client) {
-        delete client;
-    }
+GrpcClient::~GrpcClient() = default;
+
+bool GrpcClient::isConnected() {
+    return impl_->IsConnected();
 }
 
-bool grpc_client_is_connected(grpc_client_t client) {
-    return client && client->client && client->client->IsConnected();
+bool GrpcClient::waitForConnected(int timeout_ms) {
+    return impl_->WaitForConnected(timeout_ms);
 }
 
-bool grpc_client_wait_connected(grpc_client_t client, int timeout_ms) {
-    return client && client->client && client->client->WaitForConnected(timeout_ms);
+bool GrpcClient::getProperties(const std::string& source_type) {
+    return impl_->GetProperties(source_type, cached_properties_);
 }
 
-// 獲取屬性
-bool grpc_client_get_properties(grpc_client_t client, const char* source_type) {
-    if (!client || !client->client) return false;
-    return client->client->GetProperties(source_type, client->cached_properties);
+bool GrpcClient::startStream(const std::string& source_type,
+                              const std::map<std::string, std::string>& settings,
+                              VideoCallback on_video,
+                              AudioCallback on_audio) {
+    return impl_->StartStream(source_type, settings, on_video, on_audio);
 }
 
-size_t grpc_client_property_count(grpc_client_t client) {
-    return client ? client->cached_properties.size() : 0;
+void GrpcClient::stopStream() {
+    impl_->StopStream();
 }
 
-const char* grpc_client_property_name(grpc_client_t client, size_t index) {
-    if (!client || index >= client->cached_properties.size()) return nullptr;
-    return client->cached_properties[index].name().c_str();
+bool GrpcClient::isStreaming() const {
+    return impl_->IsStreaming();
 }
-
-const char* grpc_client_property_description(grpc_client_t client, size_t index) {
-    if (!client || index >= client->cached_properties.size()) return nullptr;
-    return client->cached_properties[index].description().c_str();
-}
-
-int grpc_client_property_type(grpc_client_t client, size_t index) {
-    if (!client || index >= client->cached_properties.size()) return 0;
-    return client->cached_properties[index].type();
-}
-
-size_t grpc_client_property_item_count(grpc_client_t client, size_t index) {
-    if (!client || index >= client->cached_properties.size()) return 0;
-    return client->cached_properties[index].items_size();
-}
-
-const char* grpc_client_property_item_name(grpc_client_t client, size_t prop_index, size_t item_index) {
-    if (!client || prop_index >= client->cached_properties.size()) return nullptr;
-    const auto& prop = client->cached_properties[prop_index];
-    if (item_index >= (size_t)prop.items_size()) return nullptr;
-    return prop.items(static_cast<int>(item_index)).name().c_str();
-}
-
-const char* grpc_client_property_item_value(grpc_client_t client, size_t prop_index, size_t item_index) {
-    if (!client || prop_index >= client->cached_properties.size()) return nullptr;
-    const auto& prop = client->cached_properties[prop_index];
-    if (item_index >= (size_t)prop.items_size()) return nullptr;
-    return prop.items(static_cast<int>(item_index)).value().c_str();
-}
-
-// 串流回調類型
-typedef void (*grpc_video_callback_t)(uint32_t width, uint32_t height,
-                                       const uint8_t* jpeg_data, size_t jpeg_size,
-                                       uint64_t timestamp_ns, void* user_data);
-typedef void (*grpc_audio_callback_t)(uint32_t sample_rate, uint32_t channels,
-                                       const float* pcm_data, size_t samples,
-                                       uint64_t timestamp_ns, void* user_data);
-
-struct stream_callback_data {
-    grpc_video_callback_t video_cb;
-    grpc_audio_callback_t audio_cb;
-    void* user_data;
-};
-
-static thread_local stream_callback_data g_stream_callbacks;
-
-bool grpc_client_start_stream(grpc_client_t client, const char* source_type,
-                               const char** setting_keys, const char** setting_values, 
-                               size_t settings_count,
-                               grpc_video_callback_t on_video,
-                               grpc_audio_callback_t on_audio,
-                               void* user_data) {
-    if (!client || !client->client) return false;
-    
-    std::map<std::string, std::string> settings;
-    for (size_t i = 0; i < settings_count; i++) {
-        settings[setting_keys[i]] = setting_values[i];
-    }
-    
-    g_stream_callbacks.video_cb = on_video;
-    g_stream_callbacks.audio_cb = on_audio;
-    g_stream_callbacks.user_data = user_data;
-    
-    return client->client->StartStream(
-        source_type, settings,
-        [](uint32_t w, uint32_t h, const uint8_t* d, size_t s, uint64_t t) {
-            if (g_stream_callbacks.video_cb) {
-                g_stream_callbacks.video_cb(w, h, d, s, t, g_stream_callbacks.user_data);
-            }
-        },
-        [](uint32_t sr, uint32_t ch, const float* d, size_t s, uint64_t t) {
-            if (g_stream_callbacks.audio_cb) {
-                g_stream_callbacks.audio_cb(sr, ch, d, s, t, g_stream_callbacks.user_data);
-            }
-        }
-    );
-}
-
-void grpc_client_stop_stream(grpc_client_t client) {
-    if (client && client->client) {
-        client->client->StopStream();
-    }
-}
-
-bool grpc_client_is_streaming(grpc_client_t client) {
-    return client && client->client && client->client->IsStreaming();
-}
-
-}  // extern "C"
 
 #endif  // HAVE_GRPC
