@@ -25,10 +25,8 @@
 #include <sstream>
 #include <map>
 
-// TurboJPEG (用於解碼)
-#ifdef HAVE_TURBOJPEG
-#include <turbojpeg.h>
-#endif
+// 視頻編解碼器
+#include "video_codec.h"
 
 // 捕捉模式常數
 #define CAPTURE_MODE_WINDOW 0
@@ -102,9 +100,8 @@ struct remote_source_data {
     };
     std::vector<CachedProperty> cached_props;
 
-#ifdef HAVE_TURBOJPEG
-    tjhandle jpeg_decompressor;
-#endif
+    // 視頻解碼器緩存 (按 codec 類型)
+    std::map<VideoCodecType, std::unique_ptr<IVideoDecoder>> decoders;
 
     remote_source_data() :
         source(nullptr),
@@ -117,9 +114,6 @@ struct remote_source_data {
         tex_width(0),
         tex_height(0),
         frame_ready(false)
-#ifdef HAVE_TURBOJPEG
-        , jpeg_decompressor(nullptr)
-#endif
     {}
 };
 
@@ -218,40 +212,60 @@ static bool request_properties(remote_source_data* data) {
 // ========== gRPC 回調函數 ==========
 // gRPC 視頻回調
 static void grpc_video_callback(uint32_t width, uint32_t height,
-                                 const uint8_t* jpeg_data, size_t jpeg_size,
+                                 int codec,
+                                 const uint8_t* frame_data, size_t frame_size,
+                                 uint32_t linesize,
                                  uint64_t timestamp_ns, void* user_data) {
     UNUSED_PARAMETER(timestamp_ns);
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data) return;
     
-#ifdef HAVE_TURBOJPEG
-    // 解碼 JPEG
-    int w, h, subsamp, colorspace;
-    if (tjDecompressHeader3(data->jpeg_decompressor,
-            jpeg_data, (unsigned long)jpeg_size,
-            &w, &h, &subsamp, &colorspace) == 0) {
-        
-        size_t buffer_size = w * h * 4;  // RGBA
-        std::vector<uint8_t> decoded(buffer_size);
-        
-        if (tjDecompress2(data->jpeg_decompressor,
-                jpeg_data, (unsigned long)jpeg_size,
-                decoded.data(), w, 0, h,
-                TJPF_BGRA, TJFLAG_FASTDCT) == 0) {
-            
-            std::lock_guard<std::mutex> lock(data->video_mutex);
-            data->tex_width = w;
-            data->tex_height = h;
-            data->frame_buffer = std::move(decoded);
-            data->frame_ready = true;
+    // 計數器用於日誌
+    static uint32_t callback_count = 0;
+    callback_count++;
+    
+    VideoCodecType codec_type = static_cast<VideoCodecType>(codec);
+    
+    // 獲取或創建解碼器
+    IVideoDecoder* decoder = nullptr;
+    auto it = data->decoders.find(codec_type);
+    if (it != data->decoders.end()) {
+        decoder = it->second.get();
+    } else {
+        // 創建新解碼器
+        auto new_decoder = createDecoder(codec_type);
+        if (new_decoder) {
+            blog(LOG_INFO, "[Remote Source] Created decoder: %s", new_decoder->getName());
+            decoder = new_decoder.get();
+            data->decoders[codec_type] = std::move(new_decoder);
         }
     }
-#else
-    UNUSED_PARAMETER(width);
-    UNUSED_PARAMETER(height);
-    UNUSED_PARAMETER(jpeg_data);
-    UNUSED_PARAMETER(jpeg_size);
-#endif
+    
+    if (!decoder) {
+        if (callback_count % 100 == 1) {
+            blog(LOG_WARNING, "[Remote Source] No decoder available for codec type %d", codec);
+        }
+        return;
+    }
+    
+    // 解碼
+    std::vector<uint8_t> decoded;
+    if (decoder->decode(frame_data, frame_size, width, height, linesize, decoded)) {
+        std::lock_guard<std::mutex> lock(data->video_mutex);
+        data->tex_width = width;
+        data->tex_height = height;
+        data->frame_buffer = std::move(decoded);
+        data->frame_ready = true;
+        
+        // 每 100 幀輸出一次解碼資訊
+        if (callback_count % 100 == 1) {
+            blog(LOG_INFO, "[Remote Source] Decoded frame #%u: %ux%u, codec=%s, input=%zu, output=%zu",
+                 callback_count, width, height, decoder->getName(), 
+                 frame_size, data->frame_buffer.size());
+        }
+    } else {
+        blog(LOG_WARNING, "[Remote Source] Decoder failed for frame #%u", callback_count);
+    }
 }
 
 // gRPC 音頻回調
@@ -297,8 +311,9 @@ static void start_streaming(remote_source_data* data) {
     remote_source_data* capture_data = data;
     
     if (!data->grpc_client->startStream(source_type, settings,
-            [capture_data](uint32_t w, uint32_t h, const uint8_t* d, size_t s, uint64_t t) {
-                grpc_video_callback(w, h, d, s, t, capture_data);
+            [capture_data](uint32_t w, uint32_t h, int codec, 
+                           const uint8_t* d, size_t s, uint32_t ls, uint64_t t) {
+                grpc_video_callback(w, h, codec, d, s, ls, t, capture_data);
             },
             [capture_data](uint32_t sr, uint32_t ch, const float* d, size_t s, uint64_t t) {
                 grpc_audio_callback(sr, ch, d, s, t, capture_data);
@@ -336,9 +351,7 @@ static void* remote_source_create(obs_data_t* settings, obs_source_t* source) {
     remote_source_data* data = new remote_source_data();
     data->source = source;
 
-#ifdef HAVE_TURBOJPEG
-    data->jpeg_decompressor = tjInitDecompress();
-#endif
+    // 解碼器會在接收時動態創建
 
     // 載入設定
     data->server_ip = obs_data_get_string(settings, "server_ip");
@@ -367,11 +380,8 @@ static void remote_source_destroy(void* data_ptr) {
     }
     obs_leave_graphics();
 
-#ifdef HAVE_TURBOJPEG
-    if (data->jpeg_decompressor) {
-        tjDestroy(data->jpeg_decompressor);
-    }
-#endif
+    // 解碼器由 map 自動清理
+    data->decoders.clear();
 
     delete data;
 }

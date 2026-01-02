@@ -1,6 +1,13 @@
 syntax = "proto3";
 package obsremote;
 
+// 視頻編碼類型
+enum VideoCodec {
+  CODEC_RAW_BGRA = 0;  // 無壓縮 BGRA
+  CODEC_JPEG = 1;       // JPEG 壓縮
+  CODEC_H264 = 2;       // 未來: H.264/NVENC
+}
+
 // 屬性類型
 enum PropertyType {
   PROPERTY_UNKNOWN = 0;
@@ -62,15 +69,18 @@ message GetPropertiesResponse {
 message StartStreamRequest {
   string source_type = 1;
   map<string, string> settings = 2;
+  VideoCodec preferred_codec = 3;  // 客戶端偏好的編碼格式
 }
 
 // 視頻幀
 message VideoFrame {
   uint32 width = 1;
   uint32 height = 2;
-  bytes jpeg_data = 3;
-  uint64 timestamp_ns = 4;
-  uint32 frame_number = 5;
+  VideoCodec codec = 3;      // 實際使用的編碼類型
+  bytes frame_data = 4;      // 編碼後的數據
+  uint64 timestamp_ns = 5;
+  uint32 frame_number = 6;
+  uint32 linesize = 7;       // Raw 格式時的行寬 (bytes per row)
 }
 
 // 音頻幀

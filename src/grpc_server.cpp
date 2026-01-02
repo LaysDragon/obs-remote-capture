@@ -35,9 +35,7 @@
 #include <memory>
 #include <queue>
 
-#ifdef HAVE_TURBOJPEG
-#include <turbojpeg.h>
-#endif
+#include "video_codec.h"
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -60,9 +58,8 @@ struct GrpcStreamSession {
     uint32_t height = 0;
     uint32_t frame_number = 0;
     
-#ifdef HAVE_TURBOJPEG
-    tjhandle jpeg_compressor = nullptr;
-#endif
+    // 視頻編碼器
+    std::unique_ptr<IVideoEncoder> encoder;
 
     // 音頻隊列
     std::queue<AudioFrame> audio_queue;
@@ -108,15 +105,33 @@ static void grpc_audio_callback(void* param, obs_source_t* source,
 
 // ========== 捕獲視頻幀 ==========
 static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_frame) {
-    if (!session || !session->capture_source || !session->active.load()) return false;
+    if (!session || !session->capture_source || !session->active.load()) {
+        blog(LOG_DEBUG, "[gRPC Server] capture_video_frame: session invalid or inactive");
+        return false;
+    }
     
     uint32_t width = obs_source_get_width(session->capture_source);
     uint32_t height = obs_source_get_height(session->capture_source);
     
-    if (width == 0 || height == 0) return false;
+    // 每 100 幀輸出一次尺寸資訊
+    static uint32_t frame_log_counter = 0;
+    if (++frame_log_counter % 100 == 1) {
+        blog(LOG_INFO, "[gRPC Server] Source size: %ux%u (frame %u)", 
+             width, height, session->frame_number);
+    }
+    
+    if (width == 0 || height == 0) {
+        if (frame_log_counter % 30 == 1) {
+            blog(LOG_WARNING, "[gRPC Server] Source size is 0x0, source may not be active");
+        }
+        return false;
+    }
     
     // 重新創建渲染資源 (尺寸變化時)
     if (width != session->width || height != session->height) {
+        blog(LOG_INFO, "[gRPC Server] Recreating render resources: %ux%u -> %ux%u",
+             session->width, session->height, width, height);
+        
         obs_enter_graphics();
         
         if (session->texrender) gs_texrender_destroy(session->texrender);
@@ -127,61 +142,76 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
         session->width = width;
         session->height = height;
         
+        blog(LOG_INFO, "[gRPC Server] Created texrender=%p, stagesurface=%p",
+             (void*)session->texrender, (void*)session->stagesurface);
+        
         obs_leave_graphics();
     }
     
-    if (!session->texrender || !session->stagesurface) return false;
+    if (!session->texrender || !session->stagesurface) {
+        blog(LOG_WARNING, "[gRPC Server] texrender or stagesurface is null");
+        return false;
+    }
     
     obs_enter_graphics();
     
     // 渲染源到紋理
+    bool render_success = false;
     if (gs_texrender_begin(session->texrender, width, height)) {
-        struct vec4 clear_color;
-        vec4_zero(&clear_color);
+        struct vec4 clear_color = {0};
         gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
         gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
         
         obs_source_video_render(session->capture_source);
         gs_texrender_end(session->texrender);
+        render_success = true;
+    } else {
+        blog(LOG_WARNING, "[gRPC Server] gs_texrender_begin failed");
     }
     
     // 複製到 staging surface
     gs_texture_t* tex = gs_texrender_get_texture(session->texrender);
     bool success = false;
     
-    if (tex) {
+    if (!tex) {
+        blog(LOG_WARNING, "[gRPC Server] gs_texrender_get_texture returned null");
+    } else {
         gs_stage_texture(session->stagesurface, tex);
         
         uint8_t* data;
         uint32_t linesize;
         if (gs_stagesurface_map(session->stagesurface, &data, &linesize)) {
-#ifdef HAVE_TURBOJPEG
-            // JPEG 壓縮
-            unsigned long jpeg_size = 0;
-            unsigned char* jpeg_buf = nullptr;
-            
-            int result = tjCompress2(
-                session->jpeg_compressor,
-                data, width, linesize, height,
-                TJPF_BGRA,
-                &jpeg_buf, &jpeg_size,
-                TJSAMP_420, 85, TJFLAG_FASTDCT
-            );
-            
-            if (result == 0 && jpeg_buf) {
-                out_frame->set_width(width);
-                out_frame->set_height(height);
-                out_frame->set_jpeg_data(jpeg_buf, jpeg_size);
-                out_frame->set_timestamp_ns(os_gettime_ns());
-                out_frame->set_frame_number(session->frame_number++);
-                success = true;
-                tjFree(jpeg_buf);
+            // 使用編碼器壓縮
+            if (session->encoder) {
+                std::vector<uint8_t> encoded_data;
+                uint32_t out_linesize = 0;
+                
+                if (session->encoder->encode(data, width, height, linesize, 
+                                              encoded_data, out_linesize)) {
+                    out_frame->set_width(width);
+                    out_frame->set_height(height);
+                    out_frame->set_codec(static_cast<VideoCodec>(session->encoder->getCodecType()));
+                    out_frame->set_frame_data(encoded_data.data(), encoded_data.size());
+                    out_frame->set_timestamp_ns(os_gettime_ns());
+                    out_frame->set_frame_number(session->frame_number++);
+                    out_frame->set_linesize(out_linesize);
+                    success = true;
+                    
+                    // 每 100 幀輸出一次壓縮資訊
+                    if (session->frame_number % 100 == 0) {
+                        blog(LOG_INFO, "[gRPC Server] Encoded frame=%u, codec=%s, size=%zu bytes",
+                             session->frame_number, session->encoder->getName(), 
+                             encoded_data.size());
+                    }
+                } else {
+                    blog(LOG_WARNING, "[gRPC Server] Encoder failed");
+                }
+            } else {
+                blog(LOG_WARNING, "[gRPC Server] No encoder available");
             }
-#else
-            UNUSED_PARAMETER(data);
-            UNUSED_PARAMETER(linesize);
-#endif
             gs_stagesurface_unmap(session->stagesurface);
+        } else {
+            blog(LOG_WARNING, "[gRPC Server] gs_stagesurface_map failed");
         }
     }
     
@@ -310,9 +340,13 @@ public:
         session.active.store(true);
         session.writer = writer;
         
-#ifdef HAVE_TURBOJPEG
-        session.jpeg_compressor = tjInitCompress();
-#endif
+        // 創建視頻編碼器
+        session.encoder = createDefaultEncoder();
+        if (!session.encoder) {
+            obs_source_release(capture_source);
+            return Status(grpc::StatusCode::INTERNAL, "Failed to create video encoder");
+        }
+        blog(LOG_INFO, "[gRPC Server] Using encoder: %s", session.encoder->getName());
         
         // 激活源
         obs_source_inc_showing(capture_source);
@@ -371,9 +405,8 @@ public:
         if (session.stagesurface) gs_stagesurface_destroy(session.stagesurface);
         obs_leave_graphics();
         
-#ifdef HAVE_TURBOJPEG
-        if (session.jpeg_compressor) tjDestroy(session.jpeg_compressor);
-#endif
+        // encoder 由 unique_ptr 自動清理
+        session.encoder.reset();
         
         obs_source_release(capture_source);
         

@@ -39,10 +39,18 @@ using namespace obsremote;
 class GrpcClient::Impl {
 public:
     Impl(const std::string& server_address) 
-        : channel_(grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials())),
-          stub_(RemoteCaptureService::NewStub(channel_)),
-          streaming_(false) {
-        blog(LOG_INFO, "[gRPC Client] Created client for %s", server_address.c_str());
+        : streaming_(false) {
+        // 設置頻道參數，增加訊息大小限制
+        grpc::ChannelArguments args;
+        args.SetMaxReceiveMessageSize(100 * 1024 * 1024);  // 100MB
+        args.SetMaxSendMessageSize(100 * 1024 * 1024);    // 100MB
+        
+        channel_ = grpc::CreateCustomChannel(
+            server_address, grpc::InsecureChannelCredentials(), args);
+        stub_ = RemoteCaptureService::NewStub(channel_);
+        
+        blog(LOG_INFO, "[gRPC Client] Created client for %s (max msg: 100MB)", 
+             server_address.c_str());
     }
     
     ~Impl() {
@@ -120,26 +128,44 @@ public:
             std::unique_ptr<ClientReader<StreamFrame>> reader = 
                 stub_->StartStream(stream_context_.get(), request);
             
-            blog(LOG_INFO, "[gRPC Client] Stream started");
+            blog(LOG_INFO, "[gRPC Client] Stream started, waiting for frames...");
             
             StreamFrame frame;
+            uint32_t video_frame_count = 0;
+            uint32_t audio_frame_count = 0;
+            
             while (streaming_.load() && reader->Read(&frame)) {
                 if (frame.has_video()) {
                     const VideoFrame& v = frame.video();
+                    video_frame_count++;
+                    
+                    // 每 100 幀輸出一次接收資訊
+                    if (video_frame_count % 100 == 1) {
+                        blog(LOG_INFO, "[gRPC Client] Received video frame #%u: %ux%u, codec=%d, size=%zu",
+                             video_frame_count, v.width(), v.height(), 
+                             v.codec(), v.frame_data().size());
+                    }
+                    
                     if (on_video_) {
                         on_video_(v.width(), v.height(),
-                                  reinterpret_cast<const uint8_t*>(v.jpeg_data().data()),
-                                  v.jpeg_data().size(),
+                                  static_cast<int>(v.codec()),
+                                  reinterpret_cast<const uint8_t*>(v.frame_data().data()),
+                                  v.frame_data().size(),
+                                  v.linesize(),
                                   v.timestamp_ns());
                     }
                 } else if (frame.has_audio()) {
                     const AudioFrame& a = frame.audio();
+                    audio_frame_count++;
+                    
                     if (on_audio_) {
                         on_audio_(a.sample_rate(), a.channels(),
                                   reinterpret_cast<const float*>(a.pcm_data().data()),
                                   a.pcm_data().size() / sizeof(float) / a.channels(),
                                   a.timestamp_ns());
                     }
+                } else {
+                    blog(LOG_DEBUG, "[gRPC Client] Received frame with no video or audio");
                 }
             }
             
@@ -149,7 +175,8 @@ public:
                      status.error_message().c_str());
             }
             
-            blog(LOG_INFO, "[gRPC Client] Stream stopped");
+            blog(LOG_INFO, "[gRPC Client] Stream stopped. Total: video=%u, audio=%u frames",
+                 video_frame_count, audio_frame_count);
         });
         
         return true;

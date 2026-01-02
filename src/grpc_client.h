@@ -29,8 +29,14 @@ namespace obsremote {
 class GrpcClient {
 public:
     // 回調類型定義
+    // VideoCallback: 接收視頻幀數據
+    //   codec: 編碼類型 (與 VideoCodecType enum 對應)
+    //   frame_data/frame_size: 編碼後的數據
+    //   linesize: Raw 格式時的行寬 (JPEG 時為 0)
     using VideoCallback = std::function<void(uint32_t width, uint32_t height, 
-                                              const uint8_t* jpeg_data, size_t jpeg_size,
+                                              int codec,
+                                              const uint8_t* frame_data, size_t frame_size,
+                                              uint32_t linesize,
                                               uint64_t timestamp_ns)>;
     using AudioCallback = std::function<void(uint32_t sample_rate, uint32_t channels,
                                               const float* pcm_data, size_t samples,

@@ -52,6 +52,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin-main.c
   src/remote-client-source.cpp
   src/capture-preview-source.cpp
+  src/video_codec.cpp
+  src/codec_raw.cpp
+  src/codec_jpeg.cpp
 )
 
 # ========== Windows 網路庫 ==========
