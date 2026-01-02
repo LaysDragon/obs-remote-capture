@@ -24,6 +24,8 @@ extern void init_capture_preview_info(void);
 extern void obs_grpc_server_start(void);
 extern void obs_grpc_server_stop(void);
 
+extern void obs_ffmpeg_log_available_encoders(void);
+
 // 插件載入時調用
 bool obs_module_load(void)
 {
@@ -42,6 +44,9 @@ bool obs_module_load(void)
     // 啟動 gRPC 伺服器 (發送端使用)
     obs_grpc_server_start();
     blog(LOG_INFO, "[Remote Window Capture] gRPC server started on port 44555");
+    
+    // 列出可用編碼器
+    // obs_ffmpeg_log_available_encoders();
 
     blog(LOG_INFO, "[Remote Window Capture] Plugin loaded successfully.");
     return true;

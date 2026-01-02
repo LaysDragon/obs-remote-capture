@@ -9,6 +9,29 @@
 
 
 
+// ========== 輔助功能 ==========
+extern "C" void obs_ffmpeg_log_available_encoders(void) {
+    blog(LOG_INFO, "[FFmpeg] --- Available Encoders ---");
+    
+    void* iter = nullptr;
+    const AVCodec* codec = nullptr;
+    
+    while ((codec = av_codec_iterate(&iter))) {
+        if (av_codec_is_encoder(codec)) {
+            // 只列出視頻編碼器，或者包含 H.264 的
+            if (codec->type == AVMEDIA_TYPE_VIDEO) {
+                 // 檢查是否為 H.264 相關 (可選，這裡列出所有視頻編碼器以便調試)
+                //  if (strstr(codec->name, "h264") || strstr(codec->name, "qsv") || strstr(codec->name, "nvenc")) {
+                //      blog(LOG_INFO, "[FFmpeg] Encoder: %s (%s)", codec->name, codec->long_name);
+                //  }
+                blog(LOG_INFO, "[FFmpeg] Encoder: %s (%s)", codec->name, codec->long_name);
+
+            }
+        }
+    }
+    blog(LOG_INFO, "[FFmpeg] --------------------------");
+}
+
 // ========== 編碼器實現 ==========
 
 FFmpegEncoder::FFmpegEncoder() = default;
@@ -39,7 +62,7 @@ bool FFmpegEncoder::initEncoder(const char* encoder_name) {
     blog(LOG_INFO, "[FFmpeg] Trying encoder: %s", encoder_name);
     const AVCodec* codec = avcodec_find_encoder_by_name(encoder_name);
     if (!codec) {
-        blog(LOG_ERROR, "[FFmpeg] Encoder not found: %s", encoder_name);
+        blog(LOG_WARNING, "[FFmpeg] Encoder not found: %s", encoder_name);
         return false;
     }
     
@@ -58,19 +81,36 @@ bool FFmpegEncoder::initEncoder(const char* encoder_name) {
     ctx_->gop_size = 30;  // 每 30 幀一個 keyframe
     ctx_->max_b_frames = 0;  // 禁用 B-frame 減少延遲
     
-    // 低延遲設定
-    av_opt_set(ctx_->priv_data, "tune", "zerolatency", 0);
-    av_opt_set(ctx_->priv_data, "preset", "fast", 0);
-    
-    // NVENC 特定設定
+    // 編碼器特定設定
     if (strstr(encoder_name, "nvenc")) {
+        // NVENC 設定
+        av_opt_set(ctx_->priv_data, "preset", "p1", 0);  // 最快
+        av_opt_set(ctx_->priv_data, "tune", "ll", 0);    // 低延遲
         av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
         av_opt_set(ctx_->priv_data, "delay", "0", 0);
         av_opt_set(ctx_->priv_data, "zerolatency", "1", 0);
+    } else if (strstr(encoder_name, "qsv")) {
+        // Intel QSV 設定
+        av_opt_set(ctx_->priv_data, "preset", "veryfast", 0);
+        av_opt_set(ctx_->priv_data, "low_power", "1", 0);
+        // QSV 需要不同的像素格式
+        ctx_->pix_fmt = AV_PIX_FMT_NV12;
+    } else if (strstr(encoder_name, "amf")) {
+        // AMD AMF 設定
+        av_opt_set(ctx_->priv_data, "quality", "speed", 0);
+        av_opt_set(ctx_->priv_data, "rc", "cbr", 0);
+    } else if (strstr(encoder_name, "libx264")) {
+        // 軟體編碼器設定
+        av_opt_set(ctx_->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(ctx_->priv_data, "tune", "zerolatency", 0);
     }
     
-    if (avcodec_open2(ctx_, codec, nullptr) < 0) {
-        blog(LOG_ERROR, "[FFmpeg] Failed to open encoder");
+    int ret = avcodec_open2(ctx_, codec, nullptr);
+    if (ret < 0) {
+        char err_buf[256];
+        av_strerror(ret, err_buf, sizeof(err_buf));
+        blog(LOG_WARNING, "[FFmpeg] Failed to open encoder %s: %s (error code: %d)", 
+             encoder_name, err_buf, ret);
         avcodec_free_context(&ctx_);
         return false;
     }
@@ -99,21 +139,35 @@ bool FFmpegEncoder::init(uint32_t width, uint32_t height, int fps, int bitrate_k
         if (initEncoder(encoders[i])) {
             blog(LOG_INFO, "[FFmpeg] Using encoder: %s", encoders[i]);
             
-            // 分配 frame 和 packet
+            // 獲取編碼器的像素格式
+            AVPixelFormat pix_fmt = ctx_->pix_fmt;
+            blog(LOG_INFO, "[FFmpeg] Encoder pixel format: %d", (int)pix_fmt);
+            
+            // 分配 frame 和 packet（使用編碼器的像素格式）
             frame_ = av_frame_alloc();
-            frame_->format = AV_PIX_FMT_YUV420P;
+            frame_->format = pix_fmt;
             frame_->width = width;
             frame_->height = height;
-            av_frame_get_buffer(frame_, 0);
+            if (av_frame_get_buffer(frame_, 0) < 0) {
+                blog(LOG_ERROR, "[FFmpeg] Failed to allocate frame buffer");
+                reset();
+                continue;  // 嘗試下一個編碼器
+            }
             
             pkt_ = av_packet_alloc();
             
-            // 創建 BGRA → YUV420P 轉換器
+            // 創建 BGRA → 編碼器格式 轉換器
             sws_ = sws_getContext(
                 width, height, AV_PIX_FMT_BGRA,
-                width, height, AV_PIX_FMT_YUV420P,
+                width, height, pix_fmt,
                 SWS_BILINEAR, nullptr, nullptr, nullptr
             );
+            
+            if (!sws_) {
+                blog(LOG_ERROR, "[FFmpeg] Failed to create swscale context");
+                reset();
+                continue;  // 嘗試下一個編碼器
+            }
             
             return true;
         }

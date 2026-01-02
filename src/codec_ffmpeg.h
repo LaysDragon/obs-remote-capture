@@ -21,6 +21,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
+
+void obs_ffmpeg_log_available_encoders(void);
 }
 
 // ========== 編碼器介面 ==========

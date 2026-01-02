@@ -57,20 +57,50 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 if(WIN32)
 endif()
 
-# ========== FFmpeg (H.264 硬體編解碼) ==========
-find_package(FFmpeg COMPONENTS avcodec avutil swscale REQUIRED)
-message(STATUS "Found FFmpeg: avcodec=${FFmpeg_avcodec_VERSION}")
+# ========== FFmpeg (H.264 硬體編解碼) ===========
+# 完全繞過 FindFFmpeg 模組，直接使用 vcpkg 的靜態庫
+# 這避免了 Qt6 的 FindFFmpeg.cmake 找到 OBS deps 的動態庫
+set(FFMPEG_VCPKG_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}")
+set(FFMPEG_INCLUDE_DIR "${FFMPEG_VCPKG_DIR}/include")
+set(FFMPEG_LIB_DIR "${FFMPEG_VCPKG_DIR}/lib")
 
-# 使用 include dirs 和 libraries (避免 target 的依賴問題)
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIRS})
-target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARY_DIRS})
+# 驗證 FFmpeg 庫存在
+if(NOT EXISTS "${FFMPEG_LIB_DIR}/avcodec.lib")
+  message(FATAL_ERROR "FFmpeg avcodec.lib not found in ${FFMPEG_LIB_DIR}")
+endif()
+if(NOT EXISTS "${FFMPEG_LIB_DIR}/swscale.lib")
+  message(FATAL_ERROR "FFmpeg swscale.lib not found in ${FFMPEG_LIB_DIR}")
+endif()
+message(STATUS "Using vcpkg FFmpeg from: ${FFMPEG_VCPKG_DIR}")
+message(STATUS "  - avcodec.lib: ${FFMPEG_LIB_DIR}/avcodec.lib")
+message(STATUS "  - avutil.lib: ${FFMPEG_LIB_DIR}/avutil.lib")
+message(STATUS "  - swscale.lib: ${FFMPEG_LIB_DIR}/swscale.lib")
+# 手動設定 include 和 link 路徑
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIR})
+target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIB_DIR})
 
-# 過濾並手動連結 FFmpeg 庫
+# 連結 FFmpeg 庫（靜態連結需要連結依賴庫）
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
   avcodec
   avutil
   swscale
 )
+
+if(WIN32)
+  
+  # Windows 靜態連結依賴
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
+    libx264      # x264 編碼器
+    libmfx       # Intel QSV (Quick Sync Video)
+    # Windows 系統庫 (Media Foundation)
+    mfplat
+    mfuuid
+    strmiids
+    ole32
+    uuid
+    bcrypt
+  )
+endif()
 
 # ========== gRPC 與 Protobuf ==========
 find_package(gRPC CONFIG REQUIRED)

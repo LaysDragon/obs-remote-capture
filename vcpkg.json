@@ -8,6 +8,8 @@
         {
             "name": "ffmpeg",
             "features": [
+                "avcodec",
+                "swscale",
                 "nvcodec",
                 "x264",
                 "qsv",
