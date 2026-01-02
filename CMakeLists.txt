@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/video_codec.cpp
   src/codec_raw.cpp
   src/codec_jpeg.cpp
+  src/flow_meter.cpp
 )
 
 # ========== Windows 網路庫 ==========

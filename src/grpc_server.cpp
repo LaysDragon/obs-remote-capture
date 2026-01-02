@@ -48,88 +48,8 @@ using namespace obsremote;
 #include <QStatusBar>
 #include <QLabel>
 #include <QString>
-#include <unordered_map>
 
-
-// ========== 流量計 ==========
-class FlowMeter {
-public:
-    struct StreamMeter {
-        std::atomic<uint64_t> bytes{0};
-        uint64_t last_bytes{0};
-        double rate_per_sec{0.0};
-    };
-
-    // 註冊新串流，返回唯一 ID
-    uint64_t registerStream() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        uint64_t id = next_id_++;
-        streams_[id] = std::make_unique<StreamMeter>();
-        blog(LOG_INFO, "[FlowMeter] Registered stream %llu", (unsigned long long)id);
-        return id;
-    }
-
-    // 註銷串流
-    void unregisterStream(uint64_t id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        streams_.erase(id);
-        blog(LOG_INFO, "[FlowMeter] Unregistered stream %llu, active streams: %zu", 
-             (unsigned long long)id, streams_.size());
-    }
-
-    // 添加字節數到指定串流
-    void addBytes(uint64_t id, size_t bytes) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = streams_.find(id);
-        if (it != streams_.end()) {
-            it->second->bytes += bytes;
-        }
-    }
-
-    // 獲取格式化的總速率字串
-    QString getFormattedRate() {
-        double total = total_rate_;
-        if (total >= 1024.0 * 1024.0) {
-            return QString("%1 MB/s").arg(total / (1024.0 * 1024.0), 0, 'f', 2);
-        } else if (total >= 1024.0) {
-            return QString("%1 KB/s").arg(total / 1024.0, 0, 'f', 2);
-        } else {
-            return QString("%1 B/s").arg(total, 0, 'f', 0);
-        }
-    }
-
-    // 獲取活躍串流數量
-    size_t getActiveStreamCount() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return streams_.size();
-    }
-
-    // 每秒調用一次更新速率
-    void tick() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        double total = 0.0;
-        for (auto& pair : streams_) {
-            StreamMeter* m = pair.second.get();
-            uint64_t curr = m->bytes.load();
-            uint64_t diff = curr - m->last_bytes;
-            m->rate_per_sec = (double)diff; // bytes per second (tick is 1 sec)
-            m->last_bytes = curr;
-            total += m->rate_per_sec;
-        }
-        total_rate_ = total;
-    }
-
-    double getTotalRate() const { return total_rate_; }
-
-private:
-    std::mutex mutex_;
-    std::unordered_map<uint64_t, std::unique_ptr<StreamMeter>> streams_;
-    std::atomic<uint64_t> next_id_{1};
-    double total_rate_{0.0};
-};
-
-// 全局流量計
-static FlowMeter g_flow_meter;
+#include "flow_meter.h"
 
 // ========== 串流會話狀態 ==========
 struct GrpcStreamSession {
