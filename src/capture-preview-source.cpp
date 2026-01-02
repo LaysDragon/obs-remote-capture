@@ -4,7 +4,7 @@
  *
  * 功能:
  * 1. 內部調用 window_capture 或 game_capture
- * 2. 將擷取到的畫面延遲後顯示
+ * 2. 實時顯示擷取畫面
  * 3. 用於驗證擷取邏輯是否正常工作
  */
 
@@ -16,14 +16,12 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <deque>
 #include <vector>
 #include <string>
 #include <cstring>
 
 // ========== 常量定義 ==========
 #define DEFAULT_SOURCE_TYPE "window_capture"
-#define DEFAULT_DELAY_MS    2000
 #define CAPTURE_FPS         30
 
 // ========== 幀數據結構 ==========
@@ -46,12 +44,11 @@ struct capture_preview_data {
     
     // 設定
     std::string source_type;        // 子源類型 ID (如 "window_capture", "game_capture" 等)
-    int delay_ms;                   // 延遲毫秒數
     
-    // 視頻緩衝 (環形隊列)
-    std::deque<FrameData> video_buffer;
-    std::mutex buffer_mutex;
-    static const size_t MAX_BUFFER_FRAMES = 300;  // 最多緩存 10 秒 (30fps)
+    // 最新幀數據 (實時模式，只保留最新一幀)
+    FrameData latest_frame;
+    std::mutex frame_mutex;
+    bool has_new_frame;
     
     // 渲染資源
     gs_texrender_t* texrender;
@@ -68,7 +65,7 @@ struct capture_preview_data {
         source(nullptr),
         capture_source(nullptr),
         source_type(DEFAULT_SOURCE_TYPE),
-        delay_ms(DEFAULT_DELAY_MS),
+        has_new_frame(false),
         texrender(nullptr),
         stagesurface(nullptr),
         output_texture(nullptr),
@@ -206,20 +203,16 @@ static void capture_thread_func(capture_preview_data* data) {
                 
                 gs_stagesurface_unmap(data->stagesurface);
                 
-                // 加入緩衝區
+                // 更新最新幀 (實時模式)
                 {
-                    std::lock_guard<std::mutex> lock(data->buffer_mutex);
-                    data->video_buffer.push_back(std::move(frame));
-                    
-                    // 限制緩衝區大小
-                    while (data->video_buffer.size() > data->MAX_BUFFER_FRAMES) {
-                        data->video_buffer.pop_front();
-                    }
+                    std::lock_guard<std::mutex> lock(data->frame_mutex);
+                    data->latest_frame = std::move(frame);
+                    data->has_new_frame = true;
                     
                     success_count++;
                     if (should_log) {
-                        blog(LOG_INFO, "[Capture Preview] Frame captured! buffer_size=%zu, total_success=%u",
-                             data->video_buffer.size(), success_count);
+                        blog(LOG_INFO, "[Capture Preview] Frame captured! total_success=%u",
+                             success_count);
                     }
                 }
             } else {
@@ -365,7 +358,6 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     capture_preview_data* data = (capture_preview_data*)data_ptr;
     
     const char* new_source_type = obs_data_get_string(settings, "source_type");
-    int new_delay = (int)obs_data_get_int(settings, "delay_ms");
     
     // 如果沒有設定源類型，使用默認值
     if (!new_source_type || strlen(new_source_type) == 0) {
@@ -373,7 +365,6 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
     }
     
     data->source_type = new_source_type;
-    data->delay_ms = new_delay;
     
     // 確保子源存在並且類型正確（處理 OBS 重啟後的初始化）
     ensure_capture_source_type(data, new_source_type);
@@ -383,8 +374,8 @@ static void capture_preview_update(void* data_ptr, obs_data_t* settings) {
         obs_data_t* child_settings = extract_child_settings(settings);
         
         const char* window = obs_data_get_string(child_settings, "window");
-        blog(LOG_INFO, "[Capture Preview] Update: source_type=%s, delay=%d, window=%s", 
-             data->source_type.c_str(), data->delay_ms, window ? window : "(null)");
+        blog(LOG_INFO, "[Capture Preview] Update: source_type=%s, window=%s", 
+             data->source_type.c_str(), window ? window : "(null)");
         
         obs_source_update(data->capture_source, child_settings);
         obs_data_release(child_settings);
@@ -883,9 +874,6 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
     obs_properties_t* props = obs_properties_create();
     obs_properties_set_param(props, data, nullptr);
     
-    // ===== 延遲設定 (放在最上面) =====
-    obs_properties_add_int_slider(props, "delay_ms", "Preview Delay (ms)", 0, 5000, 100);
-    
     // ===== 源類型選擇 (白名單) =====
     obs_property_t* type_prop = obs_properties_add_list(props, "source_type", "Source Type",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -922,7 +910,6 @@ static obs_properties_t* capture_preview_get_properties(void* data_ptr) {
 
 static void capture_preview_get_defaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, "source_type", DEFAULT_SOURCE_TYPE);
-    obs_data_set_default_int(settings, "delay_ms", DEFAULT_DELAY_MS);
 }
 
 static void capture_preview_activate(void* data_ptr) {
@@ -952,10 +939,11 @@ static void capture_preview_deactivate(void* data_ptr) {
         data->capture_thread.join();
     }
     
-    // 清空緩衝區
+    // 清空最新幀
     {
-        std::lock_guard<std::mutex> lock(data->buffer_mutex);
-        data->video_buffer.clear();
+        std::lock_guard<std::mutex> lock(data->frame_mutex);
+        data->latest_frame = FrameData();
+        data->has_new_frame = false;
     }
 }
 
@@ -974,30 +962,21 @@ static void capture_preview_video_tick(void* data_ptr, float seconds) {
         return;
     }
     
-    // 從緩衝區中找到延遲後應該顯示的幀
-    uint64_t now = os_gettime_ns();
-    uint64_t delay_ns = (uint64_t)data->delay_ms * 1000000ULL;
-    uint64_t target_time = now - delay_ns;
-    
+    // 取得最新的幀 (實時模式)
     FrameData* display_frame = nullptr;
-    size_t buffer_size = 0;
+    bool has_frame = false;
     
     {
-        std::lock_guard<std::mutex> lock(data->buffer_mutex);
-        buffer_size = data->video_buffer.size();
-        
-        // 找到時間戳小於等於目標時間的最新幀
-        for (auto it = data->video_buffer.rbegin(); it != data->video_buffer.rend(); ++it) {
-            if (it->timestamp_ns <= target_time) {
-                display_frame = &(*it);
-                break;
-            }
+        std::lock_guard<std::mutex> lock(data->frame_mutex);
+        if (data->has_new_frame && data->latest_frame.width > 0 && data->latest_frame.height > 0) {
+            display_frame = &data->latest_frame;
+            has_frame = true;
         }
     }
     
     if (should_log) {
-        blog(LOG_INFO, "[Capture Preview] video_tick: buffer_size=%zu, delay=%dms, found_frame=%s",
-             buffer_size, data->delay_ms, display_frame ? "YES" : "NO");
+        blog(LOG_INFO, "[Capture Preview] video_tick: has_frame=%s",
+             has_frame ? "YES" : "NO");
     }
     
     if (display_frame && display_frame->width > 0 && display_frame->height > 0) {
