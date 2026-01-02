@@ -36,13 +36,16 @@ void FFmpegEncoder::reset() {
 }
 
 bool FFmpegEncoder::initEncoder(const char* encoder_name) {
+    blog(LOG_INFO, "[FFmpeg] Trying encoder: %s", encoder_name);
     const AVCodec* codec = avcodec_find_encoder_by_name(encoder_name);
     if (!codec) {
+        blog(LOG_ERROR, "[FFmpeg] Encoder not found: %s", encoder_name);
         return false;
     }
     
     ctx_ = avcodec_alloc_context3(codec);
     if (!ctx_) {
+        blog(LOG_ERROR, "[FFmpeg] Failed to allocate encoder context");
         return false;
     }
     
@@ -67,6 +70,7 @@ bool FFmpegEncoder::initEncoder(const char* encoder_name) {
     }
     
     if (avcodec_open2(ctx_, codec, nullptr) < 0) {
+        blog(LOG_ERROR, "[FFmpeg] Failed to open encoder");
         avcodec_free_context(&ctx_);
         return false;
     }
