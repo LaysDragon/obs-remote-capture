@@ -31,7 +31,6 @@ void FFmpegEncoder::reset() {
     if (ctx_) {
         avcodec_free_context(&ctx_);
     }
-    extra_data_.clear();
     width_ = height_ = 0;
     pts_ = 0;
 }
@@ -72,10 +71,6 @@ bool FFmpegEncoder::initEncoder(const char* encoder_name) {
         return false;
     }
     
-    // 保存 SPS/PPS
-    if (ctx_->extradata && ctx_->extradata_size > 0) {
-        extra_data_.assign(ctx_->extradata, ctx_->extradata + ctx_->extradata_size);
-    }
     
     encoder_name_ = encoder_name;
     return true;
@@ -125,8 +120,7 @@ bool FFmpegEncoder::init(uint32_t width, uint32_t height, int fps, int bitrate_k
 }
 
 bool FFmpegEncoder::encode(const uint8_t* bgra_data, uint32_t width, uint32_t height,
-                            uint32_t linesize, std::vector<uint8_t>& out_data,
-                            bool& is_keyframe) {
+                            uint32_t linesize, std::vector<uint8_t>& out_data) {
     if (!ctx_ || !frame_ || !pkt_ || !sws_) {
         return false;
     }
@@ -162,7 +156,6 @@ bool FFmpegEncoder::encode(const uint8_t* bgra_data, uint32_t width, uint32_t he
     
     // 輸出
     out_data.assign(pkt_->data, pkt_->data + pkt_->size);
-    is_keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
     
     av_packet_unref(pkt_);
     return true;
@@ -197,7 +190,7 @@ void FFmpegDecoder::reset() {
     last_width_ = last_height_ = 0;
 }
 
-bool FFmpegDecoder::init(const uint8_t* extra_data, size_t extra_size) {
+bool FFmpegDecoder::init() {
     reset();
     
     // 使用軟體解碼器 (通常足夠快)
@@ -212,12 +205,6 @@ bool FFmpegDecoder::init(const uint8_t* extra_data, size_t extra_size) {
         return false;
     }
     
-    // 設置 extradata (SPS/PPS)
-    if (extra_data && extra_size > 0) {
-        ctx_->extradata = (uint8_t*)av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE);
-        memcpy(ctx_->extradata, extra_data, extra_size);
-        ctx_->extradata_size = (int)extra_size;
-    }
     
     // 低延遲設定
     ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;

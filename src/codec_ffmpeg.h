@@ -35,14 +35,12 @@ public:
     // 編碼一幀 BGRA 數據
     // 返回 H.264 NAL units
     bool encode(const uint8_t* bgra_data, uint32_t width, uint32_t height, 
-                uint32_t linesize, std::vector<uint8_t>& out_data,
-                bool& is_keyframe);
+                uint32_t linesize, std::vector<uint8_t>& out_data);
     
     // 獲取編碼器名稱
     const char* getName() const;
     
-    // 獲取 SPS/PPS (用於解碼器初始化)
-    const std::vector<uint8_t>& getExtraData() const { return extra_data_; }
+
     
     // 重置編碼器 (尺寸變化時)
     void reset();
@@ -59,7 +57,7 @@ private:
     uint32_t height_ = 0;
     int64_t pts_ = 0;
     
-    std::vector<uint8_t> extra_data_;
+
     std::string encoder_name_;
 };
 
@@ -70,7 +68,7 @@ public:
     ~FFmpegDecoder();
     
     // 初始化解碼器
-    bool init(const uint8_t* extra_data = nullptr, size_t extra_size = 0);
+    bool init();
     
     // 解碼 H.264 數據到 BGRA
     bool decode(const uint8_t* h264_data, size_t size,

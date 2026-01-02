@@ -204,31 +204,22 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
             // 使用 FFmpeg H.264 編碼器
             if (session->encoder) {
                 std::vector<uint8_t> encoded_data;
-                bool is_keyframe = false;
-                
                 if (session->encoder->encode(data, width, height, linesize, 
-                                              encoded_data, is_keyframe)) {
+                                              encoded_data)) {
                     out_frame->set_width(width);
                     out_frame->set_height(height);
                     out_frame->set_codec(VideoCodec::CODEC_H264);
                     out_frame->set_frame_data(encoded_data.data(), encoded_data.size());
                     out_frame->set_timestamp_ns(os_gettime_ns());
                     out_frame->set_frame_number(session->frame_number++);
-                    out_frame->set_is_keyframe(is_keyframe);
-                    
-                    // 發送 SPS/PPS (keyframe 時)
-                    if (is_keyframe && !session->encoder->getExtraData().empty()) {
-                        const auto& extra = session->encoder->getExtraData();
-                        out_frame->set_sps_pps(extra.data(), extra.size());
-                    }
                     
                     success = true;
                     
                     // 每 100 幀輸出一次壓縮資訊
                     if (session->frame_number % 100 == 0) {
-                        blog(LOG_INFO, "[gRPC Server] H.264 frame=%u, encoder=%s, size=%zu, keyframe=%d",
+                        blog(LOG_INFO, "[gRPC Server] H.264 frame=%u, encoder=%s, size=%zu",
                              session->frame_number, session->encoder->getName(), 
-                             encoded_data.size(), is_keyframe);
+                             encoded_data.size());
                     }
                 } else {
                     blog(LOG_WARNING, "[gRPC Server] H.264 encode failed");
