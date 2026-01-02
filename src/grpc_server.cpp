@@ -44,6 +44,93 @@ using grpc::ServerWriter;
 using grpc::Status;
 using namespace obsremote;
 
+#include <QMainWindow>
+#include <QStatusBar>
+#include <QLabel>
+#include <QString>
+#include <unordered_map>
+
+
+// ========== 流量計 ==========
+class FlowMeter {
+public:
+    struct StreamMeter {
+        std::atomic<uint64_t> bytes{0};
+        uint64_t last_bytes{0};
+        double rate_per_sec{0.0};
+    };
+
+    // 註冊新串流，返回唯一 ID
+    uint64_t registerStream() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        uint64_t id = next_id_++;
+        streams_[id] = std::make_unique<StreamMeter>();
+        blog(LOG_INFO, "[FlowMeter] Registered stream %llu", (unsigned long long)id);
+        return id;
+    }
+
+    // 註銷串流
+    void unregisterStream(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        streams_.erase(id);
+        blog(LOG_INFO, "[FlowMeter] Unregistered stream %llu, active streams: %zu", 
+             (unsigned long long)id, streams_.size());
+    }
+
+    // 添加字節數到指定串流
+    void addBytes(uint64_t id, size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = streams_.find(id);
+        if (it != streams_.end()) {
+            it->second->bytes += bytes;
+        }
+    }
+
+    // 獲取格式化的總速率字串
+    QString getFormattedRate() {
+        double total = total_rate_;
+        if (total >= 1024.0 * 1024.0) {
+            return QString("%1 MB/s").arg(total / (1024.0 * 1024.0), 0, 'f', 2);
+        } else if (total >= 1024.0) {
+            return QString("%1 KB/s").arg(total / 1024.0, 0, 'f', 2);
+        } else {
+            return QString("%1 B/s").arg(total, 0, 'f', 0);
+        }
+    }
+
+    // 獲取活躍串流數量
+    size_t getActiveStreamCount() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return streams_.size();
+    }
+
+    // 每秒調用一次更新速率
+    void tick() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        double total = 0.0;
+        for (auto& pair : streams_) {
+            StreamMeter* m = pair.second.get();
+            uint64_t curr = m->bytes.load();
+            uint64_t diff = curr - m->last_bytes;
+            m->rate_per_sec = (double)diff; // bytes per second (tick is 1 sec)
+            m->last_bytes = curr;
+            total += m->rate_per_sec;
+        }
+        total_rate_ = total;
+    }
+
+    double getTotalRate() const { return total_rate_; }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<uint64_t, std::unique_ptr<StreamMeter>> streams_;
+    std::atomic<uint64_t> next_id_{1};
+    double total_rate_{0.0};
+};
+
+// 全局流量計
+static FlowMeter g_flow_meter;
+
 // ========== 串流會話狀態 ==========
 struct GrpcStreamSession {
     obs_source_t* capture_source = nullptr;
@@ -64,6 +151,9 @@ struct GrpcStreamSession {
     // 音頻隊列
     std::queue<AudioFrame> audio_queue;
     std::mutex audio_mutex;
+    
+    // 流量計 ID
+    uint64_t stream_id{0};
 };
 
 // ========== 音頻捕獲回調 ==========
@@ -358,6 +448,9 @@ public:
         
         blog(LOG_INFO, "[gRPC Server] Stream started");
         
+        // 註冊到流量計
+        session.stream_id = g_flow_meter.registerStream();
+        
         // 串流循環
         while (!context->IsCancelled() && session.active.load()) {
             StreamFrame frame;
@@ -368,7 +461,9 @@ public:
                 *frame.mutable_video() = video;
                 
                 std::lock_guard<std::mutex> lock(session.writer_mutex);
-                if (!writer->Write(frame)) {
+                if (writer->Write(frame)) {
+                    g_flow_meter.addBytes(session.stream_id, frame.ByteSizeLong());
+                } else {
                     blog(LOG_WARNING, "[gRPC Server] Failed to write video frame");
                     break;
                 }
@@ -383,7 +478,9 @@ public:
                     session.audio_queue.pop();
                     
                     std::lock_guard<std::mutex> wlock(session.writer_mutex);
-                    if (!writer->Write(audio_frame)) {
+                    if (writer->Write(audio_frame)) {
+                         g_flow_meter.addBytes(session.stream_id, audio_frame.ByteSizeLong());
+                    } else {
                         blog(LOG_WARNING, "[gRPC Server] Failed to write audio frame");
                         break;
                     }
@@ -396,6 +493,9 @@ public:
         
         // 清理
         session.active.store(false);
+        
+        // 從流量計註銷
+        g_flow_meter.unregisterStream(session.stream_id);
         
         obs_source_remove_audio_capture_callback(capture_source, grpc_audio_callback, &session);
         obs_source_dec_active(capture_source);
@@ -432,6 +532,26 @@ public:
 static std::unique_ptr<Server> g_server;
 static std::thread g_server_thread;
 static std::atomic<bool> g_running{false};
+static std::thread g_tick_thread;
+static QLabel* g_status_label = nullptr;
+
+// 狀態欄更新函數 (在 UI 線程調用)
+static void UpdateStatusBar(void*) {
+    if (!g_status_label) return;
+    
+    size_t active_count = g_flow_meter.getActiveStreamCount();
+    if (active_count > 0) {
+        QString rate = g_flow_meter.getFormattedRate();
+        QString text = QString("gRPC: %1 stream(s) (%2)")
+            .arg(active_count)
+            .arg(rate);
+        g_status_label->setText(text);
+        g_status_label->setStyleSheet("QLabel { color: #00ff00; }");
+    } else {
+        g_status_label->setText("gRPC: Idle");
+        g_status_label->setStyleSheet("QLabel { color: #888888; }");
+    }
+}
 
 // ========== 公開 API ==========
 extern "C" {
@@ -440,6 +560,20 @@ void obs_grpc_server_start(void) {
     if (g_running.load()) return;
     
     g_running.store(true);
+    
+    // 啟動 tick 線程 (每秒更新一次)
+    g_tick_thread = std::thread([]() {
+        while (g_running.load()) {
+            // 更新流量計速率
+            g_flow_meter.tick();
+            
+            // 在 UI 線程更新狀態欄
+            obs_queue_task(OBS_TASK_UI, UpdateStatusBar, nullptr, false);
+            
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+    
     g_server_thread = std::thread([]() {
         std::string server_address("0.0.0.0:44555");
         RemoteCaptureServiceImpl service;
@@ -447,11 +581,25 @@ void obs_grpc_server_start(void) {
         ServerBuilder builder;
         builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
         builder.RegisterService(&service);
-        builder.SetMaxReceiveMessageSize(100 * 1024 * 1024);  // 100MB
+        builder.SetMaxReceiveMessageSize(100 * 1024 * 1024);
         builder.SetMaxSendMessageSize(100 * 1024 * 1024);
         
         g_server = builder.BuildAndStart();
         blog(LOG_INFO, "[gRPC Server] Listening on %s", server_address.c_str());
+        
+        // 初始化狀態欄 UI (在主線程)
+        obs_queue_task(OBS_TASK_UI, [](void*) {
+            QMainWindow* main_window = (QMainWindow*)obs_frontend_get_main_window();
+            if (main_window) {
+                QStatusBar* status_bar = main_window->statusBar();
+                if (status_bar) {
+                    g_status_label = new QLabel("gRPC: Idle");
+                    g_status_label->setStyleSheet("QLabel { color: #888888; margin-right: 10px; }");
+                    status_bar->addPermanentWidget(g_status_label);
+                    blog(LOG_INFO, "[gRPC Server] Added status bar widget");
+                }
+            }
+        }, nullptr, false);
         
         g_server->Wait();
         blog(LOG_INFO, "[gRPC Server] Stopped");
@@ -462,6 +610,12 @@ void obs_grpc_server_stop(void) {
     if (!g_running.load()) return;
     
     g_running.store(false);
+    
+    // 停止 tick 線程
+    if (g_tick_thread.joinable()) {
+        g_tick_thread.join();
+    }
+    
     if (g_server) {
         g_server->Shutdown();
     }
@@ -469,9 +623,22 @@ void obs_grpc_server_stop(void) {
         g_server_thread.join();
     }
     g_server.reset();
+    
+    // 清理 UI
+    obs_queue_task(OBS_TASK_UI, [](void*) {
+        if (g_status_label) {
+            QMainWindow* main_window = (QMainWindow*)obs_frontend_get_main_window();
+            if (main_window && main_window->statusBar()) {
+                main_window->statusBar()->removeWidget(g_status_label);
+            }
+            g_status_label->deleteLater();
+            g_status_label = nullptr;
+        }
+    }, nullptr, false);
+    
     blog(LOG_INFO, "[gRPC Server] Shutdown complete");
 }
 
-}  // extern "C"
+}
 
-#endif  // HAVE_GRPC
+#endif
