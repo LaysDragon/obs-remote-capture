@@ -16,14 +16,12 @@
 #include <memory>
 #include <string>
 
-#ifdef HAVE_FFMPEG
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
-#endif
 
 // ========== 編碼器介面 ==========
 class FFmpegEncoder {
@@ -52,7 +50,6 @@ public:
 private:
     bool initEncoder(const char* encoder_name);
     
-#ifdef HAVE_FFMPEG
     AVCodecContext* ctx_ = nullptr;
     AVFrame* frame_ = nullptr;
     AVPacket* pkt_ = nullptr;
@@ -61,7 +58,6 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     int64_t pts_ = 0;
-#endif
     
     std::vector<uint8_t> extra_data_;
     std::string encoder_name_;
@@ -88,7 +84,6 @@ public:
     void reset();
 
 private:
-#ifdef HAVE_FFMPEG
     AVCodecContext* ctx_ = nullptr;
     AVFrame* frame_ = nullptr;
     AVPacket* pkt_ = nullptr;
@@ -96,7 +91,6 @@ private:
     
     uint32_t last_width_ = 0;
     uint32_t last_height_ = 0;
-#endif
     
     std::string decoder_name_;
 };

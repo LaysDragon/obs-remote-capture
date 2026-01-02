@@ -7,7 +7,7 @@
 #include <obs-module.h>
 #include <cstring>
 
-#ifdef HAVE_FFMPEG
+
 
 // ========== 編碼器實現 ==========
 
@@ -293,23 +293,3 @@ const char* FFmpegDecoder::getName() const {
     return decoder_name_.empty() ? "Unknown" : decoder_name_.c_str();
 }
 
-#else  // !HAVE_FFMPEG
-
-// 無 FFmpeg 的 stub 實現
-FFmpegEncoder::FFmpegEncoder() = default;
-FFmpegEncoder::~FFmpegEncoder() = default;
-void FFmpegEncoder::reset() {}
-bool FFmpegEncoder::init(uint32_t, uint32_t, int, int) { return false; }
-bool FFmpegEncoder::encode(const uint8_t*, uint32_t, uint32_t, uint32_t, 
-                            std::vector<uint8_t>&, bool&) { return false; }
-const char* FFmpegEncoder::getName() const { return "Unavailable"; }
-
-FFmpegDecoder::FFmpegDecoder() = default;
-FFmpegDecoder::~FFmpegDecoder() = default;
-void FFmpegDecoder::reset() {}
-bool FFmpegDecoder::init(const uint8_t*, size_t) { return false; }
-bool FFmpegDecoder::decode(const uint8_t*, size_t, uint32_t, uint32_t, 
-                            std::vector<uint8_t>&) { return false; }
-const char* FFmpegDecoder::getName() const { return "Unavailable"; }
-
-#endif  // HAVE_FFMPEG

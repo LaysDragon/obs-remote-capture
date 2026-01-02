@@ -8,7 +8,7 @@
  * 3. 提供 StopStream RPC - 停止串流
  */
 
-#ifdef HAVE_GRPC
+
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -575,4 +575,4 @@ void obs_grpc_server_stop(void) {
 
 }
 
-#endif
+

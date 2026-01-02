@@ -8,7 +8,6 @@
  * 3. 調用 StopStream - 停止串流
  */
 
-#ifdef HAVE_GRPC
 
 #include "grpc_client.h"
 
@@ -249,4 +248,3 @@ bool GrpcClient::isStreaming() const {
     return impl_->IsStreaming();
 }
 
-#endif  // HAVE_GRPC

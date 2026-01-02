@@ -15,10 +15,18 @@
 
 #include "grpc_client.h"
 
+
+// 禁用 protobuf 生成代碼的警告
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4267)  // size_t to int conversion
+#endif
+
 #include "remote_capture.pb.h"
+
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
 
 using namespace obsremote;
 
