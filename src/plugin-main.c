@@ -3,7 +3,7 @@
  * OBS Remote Window Capture 插件入口點
  *
  * 此插件包含兩個組件:
- * 1. Remote Server: 在發送端運行，提供視窗列表並串流畫面
+ * 1. gRPC Server: 在發送端運行，提供視窗列表並串流畫面
  * 2. Remote Source: 在接收端運行，作為 OBS 來源顯示遠端畫面
  */
 
@@ -20,14 +20,9 @@ extern struct obs_source_info capture_preview_info;
 extern void init_remote_source_info(void);
 extern void init_capture_preview_info(void);
 
-// 伺服器啟動/停止函數
-#ifdef HAVE_GRPC
+// gRPC 伺服器啟動/停止函數
 extern void obs_grpc_server_start(void);
 extern void obs_grpc_server_stop(void);
-#else
-extern void remote_server_start(void);
-extern void remote_server_stop(void);
-#endif
 
 // 插件載入時調用
 bool obs_module_load(void)
@@ -44,13 +39,9 @@ bool obs_module_load(void)
     // 註冊本地預覽來源 (驗證用)
     obs_register_source(&capture_preview_info);
 
-    // 啟動遠端伺服器 (發送端使用)
-#ifdef HAVE_GRPC
+    // 啟動 gRPC 伺服器 (發送端使用)
     obs_grpc_server_start();
     blog(LOG_INFO, "[Remote Window Capture] gRPC server started on port 44555");
-#else
-    remote_server_start();
-#endif
 
     blog(LOG_INFO, "[Remote Window Capture] Plugin loaded successfully.");
     return true;
@@ -61,12 +52,8 @@ void obs_module_unload(void)
 {
     blog(LOG_INFO, "[Remote Window Capture] Unloading plugin...");
 
-    // 停止遠端伺服器
-#ifdef HAVE_GRPC
+    // 停止 gRPC 伺服器
     obs_grpc_server_stop();
-#else
-    remote_server_stop();
-#endif
 
     blog(LOG_INFO, "[Remote Window Capture] Plugin unloaded.");
 }
@@ -81,4 +68,3 @@ const char *obs_module_description(void)
 {
     return "Capture windows from a remote computer running OBS with this plugin.";
 }
-

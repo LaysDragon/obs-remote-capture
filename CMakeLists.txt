@@ -50,10 +50,8 @@ endif()
 # ========== 源文件 ==========
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin-main.c
-  src/remote-server.cpp
   src/remote-client-source.cpp
   src/capture-preview-source.cpp
-  # src/audio-stream.cpp  # 暫時禁用，使用了已棄用的 API
 )
 
 # ========== Windows 網路庫 ==========
