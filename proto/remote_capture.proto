@@ -4,7 +4,7 @@ package obsremote;
 // 視頻編碼類型
 enum VideoCodec {
   CODEC_RAW_BGRA = 0;  // 無壓縮 BGRA
-  CODEC_JPEG = 1;       // JPEG 壓縮
+
   CODEC_H264 = 2;       // 未來: H.264/NVENC
 }
 

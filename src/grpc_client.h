@@ -32,7 +32,7 @@ public:
     // VideoCallback: 接收視頻幀數據
     //   codec: 編碼類型 (與 VideoCodecType enum 對應)
     //   frame_data/frame_size: 編碼後的數據
-    //   linesize: Raw 格式時的行寬 (JPEG 時為 0)
+    //   linesize: Raw 格式時的行寬
     using VideoCallback = std::function<void(uint32_t width, uint32_t height, 
                                               int codec,
                                               const uint8_t* frame_data, size_t frame_size,
