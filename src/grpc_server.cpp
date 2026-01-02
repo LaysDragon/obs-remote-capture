@@ -154,7 +154,7 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
     }
     
     obs_enter_graphics();
-    
+
     // 渲染源到紋理
     bool render_success = false;
     if (gs_texrender_begin(session->texrender, width, height)) {
@@ -214,7 +214,8 @@ static bool capture_video_frame(GrpcStreamSession* session, VideoFrame* out_fram
             blog(LOG_WARNING, "[gRPC Server] gs_stagesurface_map failed");
         }
     }
-    
+        
+    gs_texrender_reset(session->texrender);
     obs_leave_graphics();
     return success;
 }
