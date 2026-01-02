@@ -545,16 +545,17 @@ void obs_grpc_server_stop(void) {
     g_server.reset();
     
     // 清理 UI
-    obs_queue_task(OBS_TASK_UI, [](void*) {
-        if (g_status_label) {
-            QMainWindow* main_window = (QMainWindow*)obs_frontend_get_main_window();
-            if (main_window && main_window->statusBar()) {
-                main_window->statusBar()->removeWidget(g_status_label);
-            }
-            g_status_label->deleteLater();
-            g_status_label = nullptr;
-        }
-    }, nullptr, false);
+    // 會引起退出crash，不需要
+    // obs_queue_task(OBS_TASK_UI, [](void*) {
+    //     if (g_status_label) {
+    //         QMainWindow* main_window = (QMainWindow*)obs_frontend_get_main_window();
+    //         if (main_window && main_window->statusBar()) {
+    //             main_window->statusBar()->removeWidget(g_status_label);
+    //         }
+    //         g_status_label->deleteLater();
+    //         g_status_label = nullptr;
+    //     }
+    // }, nullptr, false);
     
     blog(LOG_INFO, "[gRPC Server] Shutdown complete");
 }
