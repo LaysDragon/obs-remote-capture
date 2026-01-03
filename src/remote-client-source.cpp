@@ -39,6 +39,7 @@ using namespace obsremote;
 #include <cstring>
 #include <sstream>
 #include <map>
+#include <chrono>
 
 // H.264 解碼器
 #include "codec_ffmpeg.h"
@@ -62,6 +63,10 @@ struct remote_source_data {
     std::string session_id;
     std::string current_source_type;
     
+    // 錯誤訊息 (用於 UI 顯示)
+    std::mutex error_mutex;
+    std::string last_error;
+    
     // 可用 source 列表 (從 server 獲取)
     std::vector<GrpcClient::SourceInfo> available_sources;
     
@@ -82,6 +87,12 @@ struct remote_source_data {
 
     // H.264 解碼器
     std::unique_ptr<FFmpegDecoder> h264_decoder;
+    
+    // 連線設定 debounce (3秒)
+    std::string pending_ip;
+    int pending_port{0};
+    std::chrono::steady_clock::time_point pending_connect_time;
+    bool pending_connect{false};
 
     remote_source_data() :
         source(nullptr),
@@ -94,18 +105,50 @@ struct remote_source_data {
         frame_ready(false),
         audio_capture(false)
     {}
+    
+    void setError(const std::string& msg) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        last_error = msg;
+        blog(LOG_WARNING, "[Remote Source] Error: %s", msg.c_str());
+    }
+    
+    void clearError() {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        last_error.clear();
+    }
+    
+    std::string getError() {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        return last_error;
+    }
 };
 
 // ========== 連接伺服器並創建 Session ==========
 static bool connect_and_create_session(remote_source_data* data) {
+    if (!data) return false;
     if (data->connected.load()) return true;
-    if (data->server_ip.empty()) return false;
+    if (data->server_ip.empty()) {
+        data->setError("Server IP not configured");
+        return false;
+    }
 
+    data->clearError();
     std::string address = data->server_ip + ":" + std::to_string(data->server_port);
-    data->grpc_client = std::make_unique<GrpcClient>(address);
     
-    if (!data->grpc_client->waitForConnected(5000)) {
-        blog(LOG_WARNING, "[Remote Source] Failed to connect to %s", address.c_str());
+    try {
+        data->grpc_client = std::make_unique<GrpcClient>(address);
+    } catch (const std::exception& e) {
+        data->setError(std::string("Failed to create client: ") + e.what());
+        return false;
+    }
+    
+    if (!data->grpc_client) {
+        data->setError("Failed to create gRPC client");
+        return false;
+    }
+    
+    if (!data->grpc_client->waitForConnected(1000)) {
+        data->setError("Connection timeout: " + address);
         data->grpc_client.reset();
         return false;
     }
@@ -114,20 +157,22 @@ static bool connect_and_create_session(remote_source_data* data) {
     
     // 獲取可用 source 列表
     if (!data->grpc_client->getAvailableSources(data->available_sources)) {
-        blog(LOG_WARNING, "[Remote Source] Failed to get available sources");
+        data->setError("Failed to get available sources");
+        // 不中斷，繼續嘗試
     } else {
         blog(LOG_INFO, "[Remote Source] Got %zu available sources", data->available_sources.size());
     }
     
     // 創建 session
     if (!data->grpc_client->createSession(data->session_id)) {
-        blog(LOG_WARNING, "[Remote Source] Failed to create session");
+        data->setError("Failed to create session");
         data->grpc_client.reset();
         return false;
     }
     
     blog(LOG_INFO, "[Remote Source] Created session: %s", data->session_id.c_str());
     data->connected.store(true);
+    data->clearError();
     return true;
 }
 
@@ -304,11 +349,15 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
     
     data->audio_capture = new_audio;
 
+    // IP/Port 變更使用 debounce，等待 3 秒後才重新連線
     if (reconnect) {
-        stop_streaming(data);
-        disconnect_and_release_session(data);
-        data->server_ip = new_ip;
-        data->server_port = new_port;
+        data->pending_ip = new_ip;
+        data->pending_port = new_port;
+        data->pending_connect_time = std::chrono::steady_clock::now();
+        data->pending_connect = true;
+        blog(LOG_INFO, "[Remote Source] Connection settings changed, will apply in 3s: %s:%d", 
+             new_ip.c_str(), new_port);
+        return;  // 延遲應用，在 video_tick 中檢查
     }
     
     // 連接並創建 session (如果需要)
@@ -368,6 +417,10 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
     // 開始串流 (如果已設定 source type)
     if (data->connected.load() && !data->current_source_type.empty() && !data->streaming.load()) {
         start_streaming(data);
+    }
+
+    if (data->source) {
+        obs_source_update_properties(data->source);
     }
 }
 
@@ -435,28 +488,93 @@ static void remote_source_video_render(void* data_ptr, gs_effect_t* effect) {
 
 static void remote_source_video_tick(void* data_ptr, float seconds) {
     UNUSED_PARAMETER(seconds);
-    UNUSED_PARAMETER(data_ptr);
+    remote_source_data* data = (remote_source_data*)data_ptr;
+    if (!data) return;
+    
+    // 檢查連線 debounce
+    if (data->pending_connect) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - data->pending_connect_time).count();
+        
+        if (elapsed >= 1) {
+            // 3秒已過，應用連線設定
+            data->pending_connect = false;
+            
+            blog(LOG_INFO, "[Remote Source] Applying connection settings: %s:%d", 
+                 data->pending_ip.c_str(), data->pending_port);
+            
+            stop_streaming(data);
+            disconnect_and_release_session(data);
+            data->server_ip = data->pending_ip;
+            data->server_port = data->pending_port;
+            
+            // 嘗試連接
+            if (!data->server_ip.empty()) {
+                connect_and_create_session(data);
+                if (data->source) {
+                    obs_source_update_properties(data->source);
+                }
+            }
+        }
+    }
 }
 
 // ========== 屬性面板 ==========
-//TODO: where is reconnect/reload from server action? 
 static bool on_refresh_clicked(obs_properties_t* props, obs_property_t* p,
                                void* data_ptr) {
     UNUSED_PARAMETER(p);
     remote_source_data* data = (remote_source_data*)data_ptr;
+    if (!data || !data->source) return false;
     
+    // 從 source 讀取當前設定 (重要：按鈕回調沒有 settings 參數)
+    obs_data_t* settings = obs_source_get_settings(data->source);
+    if (settings) {
+        std::string new_ip = obs_data_get_string(settings, "server_ip");
+        int new_port = (int)obs_data_get_int(settings, "server_port");
+        if (new_port <= 0) new_port = DEFAULT_SERVER_PORT;
+        
+        // 如果 IP/Port 改變，斷開舊連接
+        if (new_ip != data->server_ip || new_port != data->server_port) {
+            if (data->connected.load()) {
+                disconnect_and_release_session(data);
+            }
+            data->server_ip = new_ip;
+            data->server_port = new_port;
+        }
+        obs_data_release(settings);
+    }
+    
+    // 嘗試連接
     if (!data->connected.load()) {
         connect_and_create_session(data);
     }
     
-    if (!data->connected.load()) return false;
+    // 更新錯誤訊息顯示
+    obs_property_t* error_prop = obs_properties_get(props, "error_message");
+    if (error_prop) {
+        std::string err = data->getError();
+        if (!err.empty()) {
+            obs_property_set_description(error_prop, ("⚠️ " + err).c_str());
+            obs_property_set_visible(error_prop, true);
+        } else if (data->connected.load()) {
+            obs_property_set_description(error_prop, "✅ Connected");
+            obs_property_set_visible(error_prop, true);
+        } else {
+            obs_property_set_visible(error_prop, false);
+        }
+    }
+    
+    if (!data->connected.load()) return true;  // 返回 true 以刷新 UI
     
     // 更新 source type 列表
     obs_property_t* source_list = obs_properties_get(props, "source_type");
-    obs_property_list_clear(source_list);
-    
-    for (const auto& src : data->available_sources) {
-        obs_property_list_add_string(source_list, src.display_name.c_str(), src.id.c_str());
+    if (source_list) {
+        obs_property_list_clear(source_list);
+        
+        for (const auto& src : data->available_sources) {
+            obs_property_list_add_string(source_list, src.display_name.c_str(), src.id.c_str());
+        }
     }
     
     return true;
@@ -554,9 +672,27 @@ static obs_properties_t* remote_source_properties(void* data_ptr) {
     obs_properties_add_int(props, "server_port",
         "端口 (Port)", 1, 65535, 1);
 
-    // 刷新按鈕
-    obs_properties_add_button(props, "refresh",
-        "連接/刷新 (Connect/Refresh)", on_refresh_clicked);
+    // 刷新按鈕 (暫時註解，因為 settings 變更已自動觸發 update)
+    // obs_properties_add_button(props, "refresh",
+    //     "連接/刷新 (Connect/Refresh)", on_refresh_clicked);
+
+    // 錯誤/狀態訊息顯示
+    obs_property_t* error_prop = obs_properties_add_text(props, "error_message",
+        "", OBS_TEXT_INFO);
+    obs_property_set_enabled(error_prop, false);  // 只讀
+    // 初始顯示錯誤狀態
+    if (data) {
+        std::string err = data->getError();
+        if (!err.empty()) {
+            obs_property_set_description(error_prop, ("⚠️ " + err).c_str());
+        } else if (data->connected.load()) {
+            obs_property_set_description(error_prop, "✅ Connected");
+        } else {
+            obs_property_set_visible(error_prop, false);
+        }
+    } else {
+        obs_property_set_visible(error_prop, false);
+    }
 
     // Source 類型選擇 (從 server 獲取)
     obs_property_t* source_type = obs_properties_add_list(props, "source_type",
