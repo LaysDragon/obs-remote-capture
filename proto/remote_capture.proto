@@ -135,7 +135,7 @@ message VideoFrame {
 message AudioFrame {
   uint32 sample_rate = 1;
   uint32 channels = 2;
-  bytes pcm_data = 3;
+  bytes frame_data = 3;  // 原始音頻數據 (planar float)
   uint64 timestamp_ns = 4;
 }
 

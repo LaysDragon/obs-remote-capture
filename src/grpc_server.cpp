@@ -211,24 +211,25 @@ static void grpc_audio_callback(void* param, obs_source_t* source,
     if (!session || !session->streaming.load() || muted) return;
     if (!audio || audio->frames == 0) return;
     
-    // 構建音頻幀
+    // 構建音頻幀 - 直接轉發原始 planar 數據
     AudioFrame frame;
     frame.set_sample_rate(48000);
     frame.set_channels(2);
     frame.set_timestamp_ns(os_gettime_ns());
     
-    // 交錯立體聲 PCM
-    size_t pcm_size = audio->frames * 2 * sizeof(float);
-    std::vector<float> interleaved(audio->frames * 2);
-    const float* left = (const float*)audio->data[0];
-    const float* right = audio->data[1] ? (const float*)audio->data[1] : left;
+    // 計算每個 plane 的數據大小
+    size_t plane_size = audio->frames * sizeof(float);
     
-    for (uint32_t i = 0; i < audio->frames; i++) {
-        interleaved[i * 2] = left[i];
-        interleaved[i * 2 + 1] = right[i];
-    }
+    // 複製兩個 channel 的 planar 數據 (連續存儲)
+    std::vector<uint8_t> audio_buffer(plane_size * 2);
     
-    frame.set_pcm_data(interleaved.data(), pcm_size);
+    const uint8_t* left = audio->data[0];
+    const uint8_t* right = audio->data[1] ? audio->data[1] : audio->data[0];
+    
+    memcpy(audio_buffer.data(), left, plane_size);
+    memcpy(audio_buffer.data() + plane_size, right, plane_size);
+    
+    frame.set_frame_data(audio_buffer.data(), audio_buffer.size());
     
     // 加入隊列
     {

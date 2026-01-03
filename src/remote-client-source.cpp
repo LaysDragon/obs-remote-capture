@@ -248,13 +248,18 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
 }
 
 static void grpc_audio_callback(uint32_t sample_rate, uint32_t channels,
-                                 const float* pcm_data, size_t samples,
+                                 const float* frame_data, size_t samples,
                                  uint64_t timestamp_ns, void* user_data) {
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data || !data->has_audio) return;
     
     struct obs_source_audio audio = {};
-    audio.data[0] = (uint8_t*)pcm_data;
+    // frame_data 是 planar 格式: [L|L|L|...|R|R|R|...]
+    // 左聲道在前半，右聲道在後半
+    audio.data[0] = (uint8_t*)frame_data;  // Left channel
+    if (channels >= 2) {
+        audio.data[1] = (uint8_t*)(frame_data + samples);  // Right channel
+    }
     audio.frames = (uint32_t)samples;
     audio.speakers = (channels == 2) ? SPEAKERS_STEREO : SPEAKERS_MONO;
     audio.format = AUDIO_FORMAT_FLOAT_PLANAR;

@@ -289,9 +289,12 @@ public:
                     audio_frame_count++;
                     
                     if (on_audio_) {
+                        // frame_data 現在是 planar 格式 (L|L|L|...|R|R|R|...)
+                        // 每個 channel 的樣本數 = 總大小 / sizeof(float) / 2
+                        size_t samples_per_channel = a.frame_data().size() / sizeof(float) / 2;
                         on_audio_(a.sample_rate(), a.channels(),
-                                  reinterpret_cast<const float*>(a.pcm_data().data()),
-                                  a.pcm_data().size() / sizeof(float) / a.channels(),
+                                  reinterpret_cast<const float*>(a.frame_data().data()),
+                                  samples_per_channel,
                                   a.timestamp_ns());
                     }
                 }
