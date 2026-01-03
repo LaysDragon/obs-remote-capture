@@ -439,7 +439,7 @@ static void remote_source_video_tick(void* data_ptr, float seconds) {
 }
 
 // ========== 屬性面板 ==========
-//TODO: where is refresh action? 
+//TODO: where is reconnect/reload from server action? 
 static bool on_refresh_clicked(obs_properties_t* props, obs_property_t* p,
                                void* data_ptr) {
     UNUSED_PARAMETER(p);

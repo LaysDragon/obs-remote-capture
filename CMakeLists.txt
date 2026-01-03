@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/capture-preview-source.cpp
   src/codec_ffmpeg.cpp
   src/flow_meter.cpp
+  src/session_monitor.cpp
 )
 
 # ========== Windows 系統庫 ==========

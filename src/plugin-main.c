@@ -24,6 +24,10 @@ extern void init_capture_preview_info(void);
 extern void obs_grpc_server_start(void);
 extern void obs_grpc_server_stop(void);
 
+// Session Monitor Dock
+extern void session_monitor_init(void);
+extern void session_monitor_cleanup(void);
+
 extern void obs_ffmpeg_log_available_encoders(void);
 
 // 插件載入時調用
@@ -45,6 +49,9 @@ bool obs_module_load(void)
     obs_grpc_server_start();
     blog(LOG_INFO, "[Remote Window Capture] gRPC server started on port 44555");
     
+    // 初始化 Session 監控器停駐窗口
+    session_monitor_init();
+    
     // 列出可用編碼器
     // obs_ffmpeg_log_available_encoders();
 
@@ -56,6 +63,9 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
     blog(LOG_INFO, "[Remote Window Capture] Unloading plugin...");
+
+    // 清理 Session 監控器
+    session_monitor_cleanup();
 
     // 停止 gRPC 伺服器
     obs_grpc_server_stop();

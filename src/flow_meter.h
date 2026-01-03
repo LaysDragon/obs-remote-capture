@@ -40,6 +40,12 @@ public:
 
     // 獲取總速率 (bytes/sec)
     double getTotalRate() const { return total_rate_; }
+    
+    // 獲取指定串流的速率 (bytes/sec)
+    double getStreamRate(uint64_t id);
+    
+    // 格式化速率字串 (靜態工具函數)
+    static QString formatRate(double bytes_per_sec);
 
 private:
     std::mutex mutex_;

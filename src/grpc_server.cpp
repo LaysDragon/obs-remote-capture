@@ -786,3 +786,29 @@ void obs_grpc_server_stop(void) {
 }
 
 }
+
+// ========== Session 狀態導出 (供 Monitor 使用) ==========
+#include "session_monitor.h"
+
+std::vector<SessionStatus> grpc_server_get_session_status() {
+    std::vector<SessionStatus> result;
+    
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    for (const auto& pair : g_sessions) {
+        const Session* s = pair.second.get();
+        SessionStatus status;
+        status.id = s->id;
+        status.source_type = s->source_type;
+        status.encoder_name = s->encoder ? s->encoder->getName() : "None";
+        status.streaming = s->streaming.load();
+        status.stream_id = s->stream_id;  // FlowMeter 會用這個 ID 查詢實際速率
+        status.width = s->width;
+        status.height = s->height;
+        status.frame_count = s->frame_number;
+        
+        result.push_back(status);
+    }
+    
+    return result;
+}
+
