@@ -833,7 +833,7 @@ std::vector<SessionStatus> grpc_server_get_session_status() {
 
 
 static bool is_audio_active(obs_source_t* source) {
-    return true;
+    // return true;
     if (!source){ 
         blog(LOG_INFO, "[gRPC Server] is_audio_active: source is null");
         return false;
