@@ -1,6 +1,6 @@
 /*
  * grpc_client.h
- * gRPC 客戶端 C++ 類聲明
+ * gRPC 客戶端 - Session-based API
  */
 
 #ifndef GRPC_CLIENT_H
@@ -29,10 +29,6 @@ namespace obsremote {
 class GrpcClient {
 public:
     // 回調類型定義
-    // VideoCallback: 接收視頻幀數據
-    //   codec: 編碼類型 (與 VideoCodecType enum 對應)
-    //   frame_data/frame_size: 編碼後的數據
-    //   linesize: Raw 格式時的行寬
     using VideoCallback = std::function<void(uint32_t width, uint32_t height, 
                                               int codec,
                                               const uint8_t* frame_data, size_t frame_size,
@@ -42,6 +38,12 @@ public:
                                               const float* pcm_data, size_t samples,
                                               uint64_t timestamp_ns)>;
 
+    // Source 資訊
+    struct SourceInfo {
+        std::string id;
+        std::string display_name;
+    };
+    
     // 屬性項目
     struct PropertyItem {
         std::string name;
@@ -55,6 +57,16 @@ public:
         int type;
         bool visible;
         std::vector<PropertyItem> items;
+        std::string current_string;
+        
+        // Bool
+        bool default_bool;
+        
+        // Int
+        int min_int, max_int, step_int, default_int;
+        
+        // Float
+        double min_float, max_float, step_float, default_float;
     };
 
     // 構造/析構
@@ -65,13 +77,33 @@ public:
     bool isConnected();
     bool waitForConnected(int timeout_ms = 5000);
     
-    // 獲取屬性列表
-    bool getProperties(const std::string& source_type);
-    const std::vector<Property>& getCachedProperties() const { return cached_properties_; }
+    // ========== Session-based API ==========
     
-    // 串流控制
-    bool startStream(const std::string& source_type,
-                     const std::map<std::string, std::string>& settings,
+    // 獲取可用 source 類型列表
+    bool getAvailableSources(std::vector<SourceInfo>& out);
+    
+    // 創建 Session
+    bool createSession(std::string& out_session_id);
+    
+    // 釋放 Session
+    bool releaseSession(const std::string& session_id);
+    
+    // 設定 Source Type (返回新 properties)
+    bool setSourceType(const std::string& session_id, 
+                       const std::string& source_type,
+                       std::vector<Property>& out_properties);
+    
+    // 更新設定 (返回刷新後的 properties)
+    bool updateSettings(const std::string& session_id,
+                        const std::map<std::string, std::string>& settings,
+                        std::vector<Property>& out_properties);
+    
+    // 獲取屬性
+    bool getProperties(const std::string& session_id,
+                       std::vector<Property>& out_properties);
+    
+    // 串流控制 (綁定 session_id)
+    bool startStream(const std::string& session_id,
                      VideoCallback on_video,
                      AudioCallback on_audio);
     void stopStream();
@@ -80,7 +112,6 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
-    std::vector<Property> cached_properties_;
 };
 
 #endif  // GRPC_CLIENT_H

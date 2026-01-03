@@ -4,8 +4,7 @@ package obsremote;
 // 視頻編碼類型
 enum VideoCodec {
   CODEC_RAW_BGRA = 0;  // 無壓縮 BGRA
-
-  CODEC_H264 = 2;       // 未來: H.264/NVENC
+  CODEC_H264 = 2;      // H.264/NVENC
 }
 
 // 屬性類型
@@ -56,39 +55,84 @@ message Property {
   string default_text = 50;
 }
 
-// 請求獲取屬性
+// ========== Session-based API ==========
+
+// 空消息
+message Empty {}
+
+// Source 資訊
+message SourceInfo {
+  string id = 1;            // e.g., "window_capture"
+  string display_name = 2;  // e.g., "視窗擷取"
+}
+
+// 獲取可用 source 類型
+message AvailableSourcesResponse {
+  repeated SourceInfo sources = 1;
+}
+
+// 創建 Session 響應
+message CreateSessionResponse {
+  string session_id = 1;
+}
+
+// 設定 Source Type
+message SetSourceTypeRequest {
+  string session_id = 1;
+  string source_type = 2;
+}
+
+message SetSourceTypeResponse {
+  repeated Property properties = 1;
+}
+
+// 更新設定
+message UpdateSettingsRequest {
+  string session_id = 1;
+  map<string, string> settings = 2;
+}
+
+message UpdateSettingsResponse {
+  repeated Property properties = 1;
+}
+
+// 獲取屬性 (Session 版本)
 message GetPropertiesRequest {
-  string source_type = 1;  // "window_capture" or "game_capture"
+  string session_id = 1;
 }
 
 message GetPropertiesResponse {
   repeated Property properties = 1;
 }
 
-// 開始串流請求
+// 開始串流 (Session 版本)
 message StartStreamRequest {
-  string source_type = 1;
-  map<string, string> settings = 2;
-  VideoCodec preferred_codec = 3;  // 客戶端偏好的編碼格式
+  string session_id = 1;
 }
+
+// 釋放 Session
+message ReleaseSessionRequest {
+  string session_id = 1;
+}
+
+// ========== 串流數據 ==========
 
 // 視頻幀
 message VideoFrame {
   uint32 width = 1;
   uint32 height = 2;
-  VideoCodec codec = 3;      // 實際使用的編碼類型
-  bytes frame_data = 4;      // 編碼後的數據
+  VideoCodec codec = 3;
+  bytes frame_data = 4;
   uint64 timestamp_ns = 5;
   uint32 frame_number = 6;
-  uint32 linesize = 7;       // Raw 格式時的行寬 (bytes per row)
-
+  uint32 linesize = 7;
 }
 
 // 音頻幀
 message AudioFrame {
   uint32 sample_rate = 1;
   uint32 channels = 2;
-  bytes pcm_data = 3;  // Float32 interleaved stereo
+  bytes pcm_data = 3;
   uint64 timestamp_ns = 4;
 }
 
@@ -100,20 +144,20 @@ message StreamFrame {
   }
 }
 
-// 停止串流
-message StopStreamRequest {}
-message StopStreamResponse {
-  bool success = 1;
-}
-
-// 服務定義
+// ========== 服務定義 ==========
 service RemoteCaptureService {
-  // 獲取指定來源類型的屬性列表
+  // 獲取可用的 source 類型列表 (由 server 決定)
+  rpc GetAvailableSources(Empty) returns (AvailableSourcesResponse);
+  
+  // Session 管理
+  rpc CreateSession(Empty) returns (CreateSessionResponse);
+  rpc ReleaseSession(ReleaseSessionRequest) returns (Empty);
+  
+  // Source 操作 (在 session 內)
+  rpc SetSourceType(SetSourceTypeRequest) returns (SetSourceTypeResponse);
+  rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
   rpc GetProperties(GetPropertiesRequest) returns (GetPropertiesResponse);
   
-  // 開始串流 - 服務端推送影音數據
+  // 串流 (綁定 session_id)
   rpc StartStream(StartStreamRequest) returns (stream StreamFrame);
-  
-  // 停止串流
-  rpc StopStream(StopStreamRequest) returns (StopStreamResponse);
 }
