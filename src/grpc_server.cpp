@@ -55,6 +55,9 @@ using namespace obsremote;
 
 #include "flow_meter.h"
 
+// ========== 前向聲明 ==========
+static bool is_audio_active(obs_source_t* source);
+
 // ========== Session 結構 ==========
 struct Session {
     std::string id;
@@ -515,8 +518,12 @@ public:
         // 返回屬性
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        blog(LOG_INFO, "[gRPC Server] SetSourceType: created source, properties=%d",
-             response->properties_size());
+        // 檢查是否支持音頻
+        bool has_audio = is_audio_active(session->capture_source);
+        response->set_has_audio(has_audio);
+        
+        blog(LOG_INFO, "[gRPC Server] SetSourceType: created source, properties=%d, has_audio=%d",
+             response->properties_size(), has_audio);
         return Status::OK;
     }
     
@@ -559,8 +566,12 @@ public:
         // 返回刷新後的屬性
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        blog(LOG_INFO, "[gRPC Server] UpdateSettings: refreshed properties=%d",
-             response->properties_size());
+        // 檢查是否支持音頻
+        bool has_audio = is_audio_active(session->capture_source);
+        response->set_has_audio(has_audio);
+        
+        blog(LOG_INFO, "[gRPC Server] UpdateSettings: refreshed properties=%d, has_audio=%d",
+             response->properties_size(), has_audio);
         return Status::OK;
     }
     
@@ -587,8 +598,12 @@ public:
         
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        blog(LOG_INFO, "[gRPC Server] GetProperties: session=%s, count=%d",
-             session_id.c_str(), response->properties_size());
+        // 檢查是否支持音頻
+        bool has_audio = is_audio_active(session->capture_source);
+        response->set_has_audio(has_audio);
+        
+        blog(LOG_INFO, "[gRPC Server] GetProperties: session=%s, count=%d, has_audio=%d",
+             session_id.c_str(), response->properties_size(), has_audio);
         return Status::OK;
     }
     
@@ -812,3 +827,20 @@ std::vector<SessionStatus> grpc_server_get_session_status() {
     return result;
 }
 
+
+static bool is_audio_active(obs_source_t* source) {
+    return true;
+    if (!source){ 
+        blog(LOG_INFO, "[gRPC Server] is_audio_active: source is null");
+        return false;
+    }
+    uint32_t child_flags = obs_source_get_output_flags(source);
+    if (child_flags & OBS_SOURCE_AUDIO) {
+        bool audio_active = obs_source_audio_active(source);
+        blog(LOG_INFO, "[gRPC Server] is_audio_active: %s, audio_active=%d", obs_source_get_name(source), audio_active);
+        return audio_active;
+    }
+    //OBS_SOURCE_AUDIO log
+    blog(LOG_INFO, "[gRPC Server] is_audio_active: %s, no OBS_SOURCE_AUDIO flag", obs_source_get_name(source));
+    return false;
+}

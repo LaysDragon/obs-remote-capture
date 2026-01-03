@@ -84,6 +84,7 @@ message SetSourceTypeRequest {
 
 message SetSourceTypeResponse {
   repeated Property properties = 1;
+  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 更新設定
@@ -94,6 +95,7 @@ message UpdateSettingsRequest {
 
 message UpdateSettingsResponse {
   repeated Property properties = 1;
+  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 獲取屬性 (Session 版本)
@@ -103,6 +105,7 @@ message GetPropertiesRequest {
 
 message GetPropertiesResponse {
   repeated Property properties = 1;
+  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 開始串流 (Session 版本)
