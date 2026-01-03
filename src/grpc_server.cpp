@@ -519,12 +519,8 @@ public:
         // 返回屬性
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        // 檢查是否支持音頻
-        bool has_audio = is_audio_active(session->capture_source);
-        response->set_has_audio(has_audio);
-        
-        blog(LOG_INFO, "[gRPC Server] SetSourceType: created source, properties=%d, has_audio=%d",
-             response->properties_size(), has_audio);
+        blog(LOG_INFO, "[gRPC Server] SetSourceType: created source, properties=%d",
+             response->properties_size());
         return Status::OK;
     }
     
@@ -570,12 +566,8 @@ public:
         // 返回刷新後的屬性
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        // 檢查是否支持音頻
-        bool has_audio = is_audio_active(session->capture_source);
-        response->set_has_audio(has_audio);
-        
-        blog(LOG_INFO, "[gRPC Server] UpdateSettings: refreshed properties=%d, has_audio=%d",
-             response->properties_size(), has_audio);
+        blog(LOG_INFO, "[gRPC Server] UpdateSettings: refreshed properties=%d",
+             response->properties_size());
         return Status::OK;
     }
     
@@ -602,12 +594,38 @@ public:
         
         fill_properties_from_source(session->capture_source, response->mutable_properties());
         
-        // 檢查是否支持音頻
-        bool has_audio = is_audio_active(session->capture_source);
-        response->set_has_audio(has_audio);
+        blog(LOG_INFO, "[gRPC Server] GetProperties: session=%s, count=%d",
+             session_id.c_str(), response->properties_size());
+        return Status::OK;
+    }
+    
+    // 查詢音頻狀態 (供客戶端延遲調用)
+    Status IsAudioActive(ServerContext* context,
+                         const IsAudioActiveRequest* request,
+                         IsAudioActiveResponse* response) override {
+        UNUSED_PARAMETER(context);
         
-        blog(LOG_INFO, "[gRPC Server] GetProperties: session=%s, count=%d, has_audio=%d",
-             session_id.c_str(), response->properties_size(), has_audio);
+        const std::string& session_id = request->session_id();
+        
+        std::lock_guard<std::mutex> lock(g_sessions_mutex);
+        auto it = g_sessions.find(session_id);
+        if (it == g_sessions.end()) {
+            return Status(grpc::StatusCode::NOT_FOUND, "Session not found");
+        }
+        
+        Session* session = it->second.get();
+        std::lock_guard<std::mutex> source_lock(session->source_mutex);
+        
+        if (!session->capture_source) {
+            response->set_audio_active(false);
+            return Status::OK;
+        }
+        
+        bool audio_active = is_audio_active(session->capture_source);
+        response->set_audio_active(audio_active);
+        
+        blog(LOG_INFO, "[gRPC Server] IsAudioActive: session=%s, audio_active=%d",
+             session_id.c_str(), audio_active);
         return Status::OK;
     }
     

@@ -88,22 +88,22 @@ public:
     // 釋放 Session
     bool releaseSession(const std::string& session_id);
     
-    // 設定 Source Type (返回新 properties + has_audio)
+    // 設定 Source Type (返回新 properties)
     bool setSourceType(const std::string& session_id, 
                        const std::string& source_type,
-                       std::vector<Property>& out_properties,
-                       bool& out_has_audio);
+                       std::vector<Property>& out_properties);
     
-    // 更新設定 (返回刷新後的 properties + has_audio)
+    // 更新設定 (返回刷新後的 properties)
     bool updateSettings(const std::string& session_id,
                         const std::string& settings_json,
-                        std::vector<Property>& out_properties,
-                        bool& out_has_audio);
+                        std::vector<Property>& out_properties);
     
-    // 獲取屬性 (+ has_audio)
+    // 獲取屬性
     bool getProperties(const std::string& session_id,
-                       std::vector<Property>& out_properties,
-                       bool& out_has_audio);
+                       std::vector<Property>& out_properties);
+    
+    // 查詢音頻狀態 (供延遲調用)
+    bool isAudioActive(const std::string& session_id, bool& out_audio_active);
     
     // 串流控制 (綁定 session_id)
     bool startStream(const std::string& session_id,

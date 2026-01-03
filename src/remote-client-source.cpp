@@ -124,6 +124,7 @@ struct remote_source_data {
 };
 // ========== 前向聲明 ==========
 static void remote_source_update(void* data_ptr, obs_data_t* settings);
+static void schedule_audio_active_check(remote_source_data* data);
 
 // ========== 連接伺服器並創建 Session ==========
 static bool connect_and_create_session(remote_source_data* data) {
@@ -269,6 +270,44 @@ static void grpc_audio_callback(uint32_t sample_rate, uint32_t channels,
     obs_source_output_audio(data->source, &audio);
 }
 
+// ========== 延遲音頻狀態檢查 (類似 capture-preview) ==========
+struct audio_check_data {
+    remote_source_data* data;
+};
+
+static void deferred_audio_active_check(void* param) {
+    os_sleep_ms(50);  // 等待 source 初始化完成
+    
+    audio_check_data* check = (audio_check_data*)param;
+    if (!check || !check->data) {
+        delete check;
+        return;
+    }
+    
+    remote_source_data* data = check->data;
+    
+    if (data->grpc_client && !data->session_id.empty()) {
+        bool audio_active = false;
+        if (data->grpc_client->isAudioActive(data->session_id, audio_active)) {
+            data->has_audio = audio_active;
+            obs_source_set_audio_active(data->source, audio_active);
+            blog(LOG_INFO, "[Remote Source] Deferred audio check: session=%s, audio_active=%d",
+                 data->session_id.c_str(), audio_active);
+        }
+    }
+    
+    delete check;
+}
+
+static void schedule_audio_active_check(remote_source_data* data) {
+    if (!data || !data->source) return;
+    
+    audio_check_data* check = new audio_check_data();
+    check->data = data;
+    
+    obs_queue_task(OBS_TASK_UI, deferred_audio_active_check, check, false);
+}
+
 // ========== 開始串流 ==========
 static void start_streaming(remote_source_data* data) {
     if (data->streaming.load()) return;
@@ -377,19 +416,17 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
         blog(LOG_INFO, "[Remote Source] Switching source type to %s", new_source_type.c_str());
         
         std::vector<GrpcClient::Property> new_props;
-        bool has_audio = false;
-        if (data->grpc_client->setSourceType(data->session_id, new_source_type, new_props, has_audio)) {
+        if (data->grpc_client->setSourceType(data->session_id, new_source_type, new_props)) {
             data->current_source_type = new_source_type;
-            data->has_audio = has_audio;
-            
-            // 設定 source 音頻狀態
-            obs_source_set_audio_active(data->source, has_audio);
             
             std::lock_guard<std::mutex> lock(data->props_mutex);
             data->cached_props = std::move(new_props);
             
-            blog(LOG_INFO, "[Remote Source] Source type set, got %zu properties, has_audio=%d", 
-                 data->cached_props.size(), has_audio);
+            blog(LOG_INFO, "[Remote Source] Source type set, got %zu properties", 
+                 data->cached_props.size());
+            
+            // 延遲檢查音頻狀態
+            schedule_audio_active_check(data);
         }
     }
     
@@ -400,15 +437,14 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
         const char* json_str = obs_data_get_json(settings_to_send);
         if (json_str) {
             std::vector<GrpcClient::Property> new_props;
-            bool has_audio = false;
-            if (data->grpc_client->updateSettings(data->session_id, std::string(json_str), new_props, has_audio)) {
-                data->has_audio = has_audio;
-                obs_source_set_audio_active(data->source, has_audio);
-                
+            if (data->grpc_client->updateSettings(data->session_id, std::string(json_str), new_props)) {
                 std::lock_guard<std::mutex> lock(data->props_mutex);
                 data->cached_props = std::move(new_props);
-                blog(LOG_INFO, "[Remote Source] Settings updated, refreshed %zu properties, has_audio=%d",
-                        data->cached_props.size(), has_audio);
+                blog(LOG_INFO, "[Remote Source] Settings updated, refreshed %zu properties",
+                        data->cached_props.size());
+                
+                // 設定更新後延遲檢查音頻狀態
+                schedule_audio_active_check(data);
             }
         }
         obs_data_release(settings_to_send);
@@ -595,14 +631,14 @@ static bool on_source_type_changed(obs_properties_t* props, obs_property_t* p,
     
     // 設定新的 source type
     std::vector<GrpcClient::Property> new_props;
-    bool has_audio = false;
-    if (!data->grpc_client->setSourceType(data->session_id, new_type, new_props, has_audio)) {
+    if (!data->grpc_client->setSourceType(data->session_id, new_type, new_props)) {
         return false;
     }
     
     data->current_source_type = new_type;
-    data->has_audio = has_audio;
-    obs_source_set_audio_active(data->source, has_audio);
+    
+    // 延遲檢查音頻狀態
+    schedule_audio_active_check(data);
     
     {
         std::lock_guard<std::mutex> lock(data->props_mutex);

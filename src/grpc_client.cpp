@@ -163,8 +163,7 @@ public:
     // 設定 Source Type
     bool SetSourceType(const std::string& session_id,
                        const std::string& source_type,
-                       std::vector<GrpcClient::Property>& out_properties,
-                       bool& out_has_audio) {
+                       std::vector<GrpcClient::Property>& out_properties) {
         SetSourceTypeRequest request;
         request.set_session_id(session_id);
         request.set_source_type(source_type);
@@ -181,17 +180,15 @@ public:
         }
         
         convert_properties(response.properties(), out_properties);
-        out_has_audio = response.has_audio();
-        blog(LOG_INFO, "[gRPC Client] SetSourceType: %s, got %zu properties, has_audio=%d", 
-             source_type.c_str(), out_properties.size(), out_has_audio);
+        blog(LOG_INFO, "[gRPC Client] SetSourceType: %s, got %zu properties", 
+             source_type.c_str(), out_properties.size());
         return true;
     }
     
     // 更新設定
     bool UpdateSettings(const std::string& session_id,
                         const std::string& settings_json,
-                        std::vector<GrpcClient::Property>& out_properties,
-                        bool& out_has_audio) {
+                        std::vector<GrpcClient::Property>& out_properties) {
         UpdateSettingsRequest request;
         request.set_session_id(session_id);
         request.set_settings_json(settings_json);
@@ -208,16 +205,14 @@ public:
         }
         
         convert_properties(response.properties(), out_properties);
-        out_has_audio = response.has_audio();
-        blog(LOG_INFO, "[gRPC Client] UpdateSettings: got %zu refreshed properties, has_audio=%d", 
-             out_properties.size(), out_has_audio);
+        blog(LOG_INFO, "[gRPC Client] UpdateSettings: got %zu refreshed properties", 
+             out_properties.size());
         return true;
     }
     
     // 獲取屬性
     bool GetProperties(const std::string& session_id,
-                       std::vector<GrpcClient::Property>& out_properties,
-                       bool& out_has_audio) {
+                       std::vector<GrpcClient::Property>& out_properties) {
         GetPropertiesRequest request;
         request.set_session_id(session_id);
         
@@ -233,9 +228,30 @@ public:
         }
         
         convert_properties(response.properties(), out_properties);
-        out_has_audio = response.has_audio();
-        blog(LOG_INFO, "[gRPC Client] GetProperties: got %zu properties, has_audio=%d", 
-             out_properties.size(), out_has_audio);
+        blog(LOG_INFO, "[gRPC Client] GetProperties: got %zu properties", 
+             out_properties.size());
+        return true;
+    }
+    
+    // 查詢音頻狀態
+    bool IsAudioActive(const std::string& session_id, bool& out_audio_active) {
+        IsAudioActiveRequest request;
+        request.set_session_id(session_id);
+        
+        IsAudioActiveResponse response;
+        ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+        
+        Status status = stub_->IsAudioActive(&context, request, &response);
+        if (!status.ok()) {
+            blog(LOG_WARNING, "[gRPC Client] IsAudioActive failed: %s", 
+                 status.error_message().c_str());
+            return false;
+        }
+        
+        out_audio_active = response.audio_active();
+        blog(LOG_INFO, "[gRPC Client] IsAudioActive: session=%s, audio_active=%d", 
+             session_id.c_str(), out_audio_active);
         return true;
     }
     
@@ -373,22 +389,23 @@ bool GrpcClient::releaseSession(const std::string& session_id) {
 
 bool GrpcClient::setSourceType(const std::string& session_id,
                                 const std::string& source_type,
-                                std::vector<Property>& out_properties,
-                                bool& out_has_audio) {
-    return impl_->SetSourceType(session_id, source_type, out_properties, out_has_audio);
+                                std::vector<Property>& out_properties) {
+    return impl_->SetSourceType(session_id, source_type, out_properties);
 }
 
 bool GrpcClient::updateSettings(const std::string& session_id,
                                  const std::string& settings_json,
-                                 std::vector<Property>& out_properties,
-                                 bool& out_has_audio) {
-    return impl_->UpdateSettings(session_id, settings_json, out_properties, out_has_audio);
+                                 std::vector<Property>& out_properties) {
+    return impl_->UpdateSettings(session_id, settings_json, out_properties);
 }
 
 bool GrpcClient::getProperties(const std::string& session_id,
-                                std::vector<Property>& out_properties,
-                                bool& out_has_audio) {
-    return impl_->GetProperties(session_id, out_properties, out_has_audio);
+                                std::vector<Property>& out_properties) {
+    return impl_->GetProperties(session_id, out_properties);
+}
+
+bool GrpcClient::isAudioActive(const std::string& session_id, bool& out_audio_active) {
+    return impl_->IsAudioActive(session_id, out_audio_active);
 }
 
 bool GrpcClient::startStream(const std::string& session_id,

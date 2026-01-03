@@ -84,7 +84,6 @@ message SetSourceTypeRequest {
 
 message SetSourceTypeResponse {
   repeated Property properties = 1;
-  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 更新設定
@@ -95,7 +94,6 @@ message UpdateSettingsRequest {
 
 message UpdateSettingsResponse {
   repeated Property properties = 1;
-  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 獲取屬性 (Session 版本)
@@ -105,7 +103,6 @@ message GetPropertiesRequest {
 
 message GetPropertiesResponse {
   repeated Property properties = 1;
-  bool has_audio = 2;  // Whether source supports audio output
 }
 
 // 開始串流 (Session 版本)
@@ -116,6 +113,15 @@ message StartStreamRequest {
 // 釋放 Session
 message ReleaseSessionRequest {
   string session_id = 1;
+}
+
+// 音頻狀態查詢
+message IsAudioActiveRequest {
+  string session_id = 1;
+}
+
+message IsAudioActiveResponse {
+  bool audio_active = 1;
 }
 
 // ========== 串流數據 ==========
@@ -163,4 +169,7 @@ service RemoteCaptureService {
   
   // 串流 (綁定 session_id)
   rpc StartStream(StartStreamRequest) returns (stream StreamFrame);
+  
+  // 音頻狀態查詢 (延遲調用)
+  rpc IsAudioActive(IsAudioActiveRequest) returns (IsAudioActiveResponse);
 }
