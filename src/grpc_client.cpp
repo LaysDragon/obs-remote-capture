@@ -189,14 +189,12 @@ public:
     
     // 更新設定
     bool UpdateSettings(const std::string& session_id,
-                        const std::map<std::string, std::string>& settings,
+                        const std::string& settings_json,
                         std::vector<GrpcClient::Property>& out_properties,
                         bool& out_has_audio) {
         UpdateSettingsRequest request;
         request.set_session_id(session_id);
-        for (const auto& pair : settings) {
-            (*request.mutable_settings())[pair.first] = pair.second;
-        }
+        request.set_settings_json(settings_json);
         
         UpdateSettingsResponse response;
         ClientContext context;
@@ -378,10 +376,10 @@ bool GrpcClient::setSourceType(const std::string& session_id,
 }
 
 bool GrpcClient::updateSettings(const std::string& session_id,
-                                 const std::map<std::string, std::string>& settings,
+                                 const std::string& settings_json,
                                  std::vector<Property>& out_properties,
                                  bool& out_has_audio) {
-    return impl_->UpdateSettings(session_id, settings, out_properties, out_has_audio);
+    return impl_->UpdateSettings(session_id, settings_json, out_properties, out_has_audio);
 }
 
 bool GrpcClient::getProperties(const std::string& session_id,

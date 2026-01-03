@@ -90,7 +90,7 @@ message SetSourceTypeResponse {
 // 更新設定
 message UpdateSettingsRequest {
   string session_id = 1;
-  map<string, string> settings = 2;
+  string settings_json = 2; // JSON string of obs_data_t
 }
 
 message UpdateSettingsResponse {

@@ -96,7 +96,7 @@ public:
     
     // 更新設定 (返回刷新後的 properties + has_audio)
     bool updateSettings(const std::string& session_id,
-                        const std::map<std::string, std::string>& settings,
+                        const std::string& settings_json,
                         std::vector<Property>& out_properties,
                         bool& out_has_audio);
     

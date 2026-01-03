@@ -43,6 +43,7 @@ using namespace obsremote;
 
 // H.264 解碼器
 #include "codec_ffmpeg.h"
+#include "plugin-utils.h"
 
 #define DEFAULT_SERVER_PORT 44555
 
@@ -389,37 +390,23 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
     
     // 收集並應用 child_ 開頭的設定
     if (data->connected.load() && !data->current_source_type.empty()) {
-        std::map<std::string, std::string> child_settings;
-        obs_data_item_t* item = obs_data_first(settings);
-        const char* prefix = "child_";
-        const size_t prefix_len = 6;
+        obs_data_t* settings_to_send = extract_child_settings(settings);
         
-        while (item) {
-            const char* key = obs_data_item_get_name(item);
-            if (strncmp(key, prefix, prefix_len) == 0) {
-                const char* real_key = key + prefix_len;
-                //TODO: only string??
-                if (obs_data_item_gettype(item) == OBS_DATA_STRING) {
-                    const char* val = obs_data_item_get_string(item);
-                    if (val) child_settings[real_key] = val;
-                }
-            }
-            obs_data_item_next(&item);
-        }
-        
-        if (!child_settings.empty()) {
+        const char* json_str = obs_data_get_json(settings_to_send);
+        if (json_str) {
             std::vector<GrpcClient::Property> new_props;
             bool has_audio = false;
-            if (data->grpc_client->updateSettings(data->session_id, child_settings, new_props, has_audio)) {
+            if (data->grpc_client->updateSettings(data->session_id, std::string(json_str), new_props, has_audio)) {
                 data->has_audio = has_audio;
                 obs_source_set_audio_active(data->source, has_audio);
                 
                 std::lock_guard<std::mutex> lock(data->props_mutex);
                 data->cached_props = std::move(new_props);
                 blog(LOG_INFO, "[Remote Source] Settings updated, refreshed %zu properties, has_audio=%d",
-                     data->cached_props.size(), has_audio);
+                        data->cached_props.size(), has_audio);
             }
         }
+        obs_data_release(settings_to_send);
     }
     
     // 開始串流 (如果已設定 source type)

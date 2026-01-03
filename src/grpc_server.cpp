@@ -535,8 +535,8 @@ public:
         
         const std::string& session_id = request->session_id();
         
-        blog(LOG_INFO, "[gRPC Server] UpdateSettings: session=%s, count=%d", 
-             session_id.c_str(), request->settings().size());
+        blog(LOG_INFO, "[gRPC Server] UpdateSettings: session=%s, json_len=%zu", 
+             session_id.c_str(), request->settings_json().length());
         
         std::lock_guard<std::mutex> lock(g_sessions_mutex);
         auto it = g_sessions.find(session_id);
@@ -552,16 +552,19 @@ public:
         }
         
         // 構建設定
-        obs_data_t* settings = obs_data_create();
-        for (const auto& pair : request->settings()) {
-            //TODO: only string???
-            obs_data_set_string(settings, pair.first.c_str(), pair.second.c_str());
-            blog(LOG_DEBUG, "[gRPC Server]   %s = %s", pair.first.c_str(), pair.second.c_str());
-        }
+        const std::string& json_str = request->settings_json();
+        obs_data_t* settings = obs_data_create_from_json(json_str.c_str());
         
-        // 更新 source
-        obs_source_update(session->capture_source, settings);
-        obs_data_release(settings);
+        if (!settings) {
+            blog(LOG_WARNING, "[gRPC Server] Failed to parse settings JSON");
+            // 即使 parse 失敗，也可能是空 JSON? 但 create_from_json 應該處理得當
+            // 如果失敗，可能不用更新
+        } else {
+            // 更新 source
+            obs_source_update(session->capture_source, settings);
+            obs_data_release(settings);
+            blog(LOG_INFO, "[gRPC Server] Updated settings from JSON");
+        }
         
         // 返回刷新後的屬性
         fill_properties_from_source(session->capture_source, response->mutable_properties());
