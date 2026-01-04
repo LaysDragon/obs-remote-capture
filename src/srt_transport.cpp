@@ -223,7 +223,7 @@ private:
             }
         }
         
-        closeOutput();
+        // 不要在這裡調用 closeOutput()，因為 stop() 已經調用過了
         blog(LOG_INFO, "[SRT Server] Send thread exiting");
     }
     
