@@ -656,20 +656,64 @@ public:
         
         blog(LOG_INFO, "[gRPC Server] Stream started for session %s", session_id.c_str());
         
-        // 串流迴圈
+        // 串流迴圈 - 性能測量變數
+        int64_t max_encode_ms = 0;
+        int64_t max_network_ms = 0;
+        int64_t total_encode_ms = 0;
+        int64_t total_network_ms = 0;
+        uint32_t perf_frame_count = 0;
+        
         while (!context->IsCancelled() && session->streaming.load()) {
+            auto t_start = std::chrono::steady_clock::now();
+            
             // 發送視頻幀
             VideoFrame video;
-            if (capture_video_frame(session, &video)) {
+            bool captured = capture_video_frame(session, &video);
+            
+            auto t_after_encode = std::chrono::steady_clock::now();
+            
+            int64_t network_ms = 0;
+            if (captured) {
                 StreamFrame frame;
                 *frame.mutable_video() = video;
                 
                 std::lock_guard<std::mutex> lock(session->writer_mutex);
+                
+                auto t_before_write = std::chrono::steady_clock::now();
                 if (writer->Write(frame)) {
                     g_flow_meter.addBytes(session->stream_id, frame.ByteSizeLong());
                 } else {
                     blog(LOG_WARNING, "[gRPC Server] Failed to write video frame");
                     break;
+                }
+                auto t_after_write = std::chrono::steady_clock::now();
+                network_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_after_write - t_before_write).count();
+            }
+            
+            // 計算編碼時間 (包含捕獲)
+            int64_t encode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_after_encode - t_start).count();
+            
+            // 更新統計
+            if (captured) {
+                perf_frame_count++;
+                total_encode_ms += encode_ms;
+                total_network_ms += network_ms;
+                if (encode_ms > max_encode_ms) max_encode_ms = encode_ms;
+                if (network_ms > max_network_ms) max_network_ms = network_ms;
+                
+                // 每 30 幀輸出性能統計
+                if (perf_frame_count % 30 == 0) {
+                    int64_t avg_encode = total_encode_ms / 30;
+                    int64_t avg_network = total_network_ms / 30;
+                    blog(LOG_INFO, "[Perf] Session %s: encode avg=%lldms max=%lldms, network avg=%lldms max=%lldms",
+                         session->id.c_str(), avg_encode, max_encode_ms, avg_network, max_network_ms);
+                    // 重置統計
+                    total_encode_ms = 0;
+                    total_network_ms = 0;
+                    max_encode_ms = 0;
+                    max_network_ms = 0;
                 }
             }
             

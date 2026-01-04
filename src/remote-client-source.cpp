@@ -198,6 +198,18 @@ static void disconnect_and_release_session(remote_source_data* data) {
 }
 
 // ========== gRPC 回調函數 ==========
+// 客戶端性能測量變數 (static 保持跨幀狀態)
+static struct {
+    std::chrono::steady_clock::time_point last_recv_time{};
+    int64_t max_recv_interval_ms = 0;
+    int64_t max_decode_ms = 0;
+    int64_t max_recv_to_ready_ms = 0;  // 從接收到解碼完成的本地延遲
+    int64_t total_recv_interval_ms = 0;
+    int64_t total_decode_ms = 0;
+    int64_t total_recv_to_ready_ms = 0;
+    uint32_t perf_frame_count = 0;
+} client_perf;
+
 static void grpc_video_callback(uint32_t width, uint32_t height,
                                  int codec,
                                  const uint8_t* frame_data, size_t frame_size,
@@ -206,6 +218,8 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
     UNUSED_PARAMETER(linesize);
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data) return;
+    
+    auto recv_time = std::chrono::steady_clock::now();
     
     static uint32_t callback_count = 0;
     callback_count++;
@@ -216,6 +230,14 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
         }
         return;
     }
+    
+    // 計算接收間隔 (與上一幀的時間差)
+    int64_t recv_interval_ms = 0;
+    if (client_perf.last_recv_time.time_since_epoch().count() > 0) {
+        recv_interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            recv_time - client_perf.last_recv_time).count();
+    }
+    client_perf.last_recv_time = recv_time;
     
     // 確保解碼器存在
     if (!data->h264_decoder) {
@@ -229,22 +251,56 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
              data->h264_decoder->getName());
     }
     
-    // 解碼
+    // 解碼計時
+    auto decode_start = std::chrono::steady_clock::now();
+    
     std::vector<uint8_t> decoded;
     uint32_t decoded_width = 0, decoded_height = 0;
     if (data->h264_decoder->decode(frame_data, frame_size, width, height, 
                                      decoded, decoded_width, decoded_height)) {
+        auto decode_end = std::chrono::steady_clock::now();
+        int64_t decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            decode_end - decode_start).count();
+        
+        // 從接收到解碼完成的本地延遲 (不跨機器)
+        int64_t recv_to_ready_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            decode_end - recv_time).count();
+        
+        // 更新統計
+        client_perf.perf_frame_count++;
+        client_perf.total_recv_interval_ms += recv_interval_ms;
+        client_perf.total_decode_ms += decode_ms;
+        client_perf.total_recv_to_ready_ms += recv_to_ready_ms;
+        if (recv_interval_ms > client_perf.max_recv_interval_ms) 
+            client_perf.max_recv_interval_ms = recv_interval_ms;
+        if (decode_ms > client_perf.max_decode_ms) 
+            client_perf.max_decode_ms = decode_ms;
+        if (recv_to_ready_ms > client_perf.max_recv_to_ready_ms) 
+            client_perf.max_recv_to_ready_ms = recv_to_ready_ms;
+        
+        // 每 30 幀輸出統計
+        if (client_perf.perf_frame_count % 30 == 0) {
+            int64_t avg_recv = client_perf.total_recv_interval_ms / 30;
+            int64_t avg_decode = client_perf.total_decode_ms / 30;
+            int64_t avg_ready = client_perf.total_recv_to_ready_ms / 30;
+            blog(LOG_INFO, "[Client Perf] recv_interval avg=%lldms max=%lldms, decode avg=%lldms max=%lldms, recv_to_ready avg=%lldms max=%lldms",
+                 avg_recv, client_perf.max_recv_interval_ms,
+                 avg_decode, client_perf.max_decode_ms,
+                 avg_ready, client_perf.max_recv_to_ready_ms);
+            // 重置統計
+            client_perf.total_recv_interval_ms = 0;
+            client_perf.total_decode_ms = 0;
+            client_perf.total_recv_to_ready_ms = 0;
+            client_perf.max_recv_interval_ms = 0;
+            client_perf.max_decode_ms = 0;
+            client_perf.max_recv_to_ready_ms = 0;
+        }
+        
         std::lock_guard<std::mutex> lock(data->video_mutex);
         data->tex_width = decoded_width;
         data->tex_height = decoded_height;
         data->frame_buffer = std::move(decoded);
         data->frame_ready = true;
-        
-        if (callback_count % 100 == 1) {
-            uint64_t latency_ms = (os_gettime_ns() - timestamp_ns) / 1000000;
-            blog(LOG_INFO, "[Remote Source] Frame #%u: %ux%u, latency=%llu ms",
-                 callback_count, decoded_width, decoded_height, (unsigned long long)latency_ms);
-        }
     }
 }
 
