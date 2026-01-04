@@ -26,6 +26,16 @@ extern "C" {
 
 // ========== SRT Server Implementation ==========
 
+// FFmpeg 中斷回調 - 用於中斷阻塞的 I/O 操作
+static int srt_interrupt_callback(void* opaque) {
+    std::atomic<bool>* running = (std::atomic<bool>*)opaque;
+    if (running && !running->load()) {
+        blog(LOG_INFO, "[SRT Server] Interrupt callback triggered - stopping");
+        return 1;  // 返回非零值中斷操作
+    }
+    return 0;
+}
+
 class SrtServer::Impl {
 public:
     Impl() = default;
@@ -225,6 +235,10 @@ private:
             return false;
         }
         
+        // 設置中斷回調 - 讓阻塞操作可被中斷
+        fmt_ctx_->interrupt_callback.callback = srt_interrupt_callback;
+        fmt_ctx_->interrupt_callback.opaque = &running_;
+        
         // 添加視訊流 (H.264)
         const AVCodec* video_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
         if (!video_codec) {
@@ -268,16 +282,18 @@ private:
             audio_stream_ = nullptr;
         }
         
-        // 設置 SRT 選項 - 加入 timeout 避免無限阻塞
+        // 設置 SRT 選項
         AVDictionary* opts = nullptr;
         av_dict_set(&opts, "mode", "listener", 0);
         av_dict_set_int(&opts, "latency", latency_ms_ * 1000, 0);
-        av_dict_set_int(&opts, "timeout", 3000000, 0);  // 3 秒超時 (微秒)
-        av_dict_set_int(&opts, "listen_timeout", 3000, 0);  // 3 秒監聽超時 (毫秒)
+        //  - 加入 timeout 避免無限阻塞 不需要了
+        // av_dict_set_int(&opts, "timeout", 3000000, 0);  // 3 秒超時 (微秒)
+        // av_dict_set_int(&opts, "listen_timeout", 3000, 0);  // 3 秒監聽超時 (毫秒)
         
         // 打開輸出 (這會阻塞直到有客戶端連接或超時)
         blog(LOG_INFO, "[SRT Server] Waiting for client connection on %s...", srt_url_.c_str());
-        ret = avio_open2(&fmt_ctx_->pb, srt_url_.c_str(), AVIO_FLAG_WRITE, nullptr, &opts);
+        ret = avio_open2(&fmt_ctx_->pb, srt_url_.c_str(), AVIO_FLAG_WRITE, 
+                         &fmt_ctx_->interrupt_callback, &opts);
         av_dict_free(&opts);
         
         // 檢查是否被要求停止
