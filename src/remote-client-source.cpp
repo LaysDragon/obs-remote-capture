@@ -98,7 +98,6 @@ struct remote_source_data {
     
     // SRT 傳輸
     std::unique_ptr<SrtClient> srt_client;
-    std::thread srt_receive_thread;
     bool use_srt{true};  // 是否使用 SRT (vs gRPC fallback)
     int srt_port{0};
     int srt_latency_ms{200};
@@ -316,7 +315,7 @@ static void grpc_audio_callback(uint32_t sample_rate, uint32_t channels,
                                  const float* frame_data, size_t samples,
                                  uint64_t timestamp_ns, void* user_data) {
     remote_source_data* data = (remote_source_data*)user_data;
-    if (!data || !data->has_audio) return;
+    if (!data || !data->has_audio || !data->streaming.load()) return;
     
     struct obs_source_audio audio = {};
     // frame_data 是 planar 格式: [L|L|L|...|R|R|R|...]
@@ -518,17 +517,12 @@ static void stop_streaming(remote_source_data* data) {
     
     data->streaming.store(false);
     
-    // 停止 SRT 接收
+    // 停止 SRT 接收 (SrtClient 內部會 join 自己的線程)
     if (data->srt_client) {
         data->srt_client->stopReceive();
         data->srt_client->disconnect();
+        data->srt_client.reset();
     }
-    
-    // 等待 SRT 接收線程結束
-    if (data->srt_receive_thread.joinable()) {
-        data->srt_receive_thread.join();
-    }
-    data->srt_client.reset();
     
     // 停止 gRPC stream
     if (data->grpc_client) {

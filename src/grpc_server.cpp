@@ -951,6 +951,12 @@ void obs_grpc_server_stop(void) {
             Session* session = pair.second.get();
             session->streaming.store(false);
             
+            // 先停止 SRT server，避免它繼續存取音訊數據
+            if (session->srt_server) {
+                session->srt_server->stop();
+                session->srt_server.reset();
+            }
+            
             if (session->capture_source) {
                 obs_source_remove_audio_capture_callback(session->capture_source,
                     grpc_audio_callback, session);
