@@ -105,6 +105,17 @@ public:
     // 查詢音頻狀態 (供延遲調用)
     bool isAudioActive(const std::string& session_id, bool& out_audio_active);
     
+    // SRT 連線資訊
+    struct SrtInfo {
+        int port = 0;
+        int latency_ms = 200;
+        std::string passphrase;
+        bool ready = false;
+    };
+    
+    // 獲取 SRT 串流資訊
+    bool getSrtInfo(const std::string& session_id, SrtInfo& out_info);
+    
     // 串流控制 (綁定 session_id)
     bool startStream(const std::string& session_id,
                      VideoCallback on_video,

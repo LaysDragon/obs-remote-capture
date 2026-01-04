@@ -9,11 +9,13 @@
             "name": "ffmpeg",
             "features": [
                 "avcodec",
+                "avformat",
                 "swscale",
                 "nvcodec",
                 "x264",
                 "qsv",
-                "amf"
+                "amf",
+                "srt"
             ],
             "default-features": false
         }

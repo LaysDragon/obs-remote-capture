@@ -44,6 +44,7 @@ using namespace obsremote;
 // H.264 解碼器
 #include "codec_ffmpeg.h"
 #include "plugin-utils.h"
+#include "srt_transport.h"
 
 #define DEFAULT_SERVER_PORT 44555
 
@@ -94,6 +95,13 @@ struct remote_source_data {
     int pending_port{0};
     std::chrono::steady_clock::time_point pending_connect_time;
     bool pending_connect{false};
+    
+    // SRT 傳輸
+    std::unique_ptr<SrtClient> srt_client;
+    std::thread srt_receive_thread;
+    bool use_srt{true};  // 是否使用 SRT (vs gRPC fallback)
+    int srt_port{0};
+    int srt_latency_ms{200};
 
     remote_source_data() :
         source(nullptr),
@@ -364,6 +372,35 @@ static void schedule_audio_active_check(remote_source_data* data) {
     obs_queue_task(OBS_TASK_UI, deferred_audio_active_check, check, false);
 }
 
+// ========== SRT 回調函數 ==========
+static void srt_video_callback(const uint8_t* h264_data, size_t size,
+                                int64_t pts_us, bool is_keyframe, void* user_data) {
+    UNUSED_PARAMETER(pts_us);
+    UNUSED_PARAMETER(is_keyframe);
+    
+    remote_source_data* data = (remote_source_data*)user_data;
+    if (!data || !data->streaming.load()) return;
+    
+    // SRT 直接傳來 H.264 數據，需要解碼
+    // 使用 gRPC 相同的視訊回調 (codec = H264)
+    grpc_video_callback(0, 0, 2,  // codec = CODEC_H264 = 2
+                        h264_data, size, 0, 
+                        pts_us * 1000,  // 轉換為 ns
+                        user_data);
+}
+
+static void srt_audio_callback(const float* pcm_data, size_t samples,
+                                uint32_t sample_rate, uint32_t channels,
+                                int64_t pts_us, void* user_data) {
+    remote_source_data* data = (remote_source_data*)user_data;
+    if (!data || !data->streaming.load()) return;
+    
+    // 直接調用 gRPC 音訊回調
+    grpc_audio_callback(sample_rate, channels, pcm_data, samples, 
+                        pts_us * 1000,  // 轉換為 ns
+                        user_data);
+}
+
 // ========== 開始串流 ==========
 static void start_streaming(remote_source_data* data) {
     if (data->streaming.load()) return;
@@ -373,21 +410,107 @@ static void start_streaming(remote_source_data* data) {
     
     data->streaming.store(true);
     
+    // 先獲取 SRT 資訊（知道 port）
+    int srt_port = 0;
+    int srt_latency_ms = 200;
+    bool want_srt = data->use_srt && data->grpc_client;
+    
+    if (want_srt) {
+        GrpcClient::SrtInfo srt_info;
+        if (data->grpc_client->getSrtInfo(data->session_id, srt_info)) {
+            srt_port = srt_info.port;
+            srt_latency_ms = srt_info.latency_ms;
+            data->srt_port = srt_port;
+            data->srt_latency_ms = srt_latency_ms;
+            
+            blog(LOG_INFO, "[Remote Source] Got SRT info: port=%d, latency=%dms",
+                 srt_port, srt_latency_ms);
+        } else {
+            want_srt = false;
+        }
+    }
+    
     remote_source_data* capture_data = data;
     
+    // 先啟動 gRPC stream（這會觸發服務器啟動 SRT）
+    // 視訊和音訊: 當 SRT 連接時忽略 gRPC 數據，否則使用 gRPC
     if (!data->grpc_client->startStream(data->session_id,
             [capture_data](uint32_t w, uint32_t h, int codec, 
                            const uint8_t* d, size_t s, uint32_t ls, uint64_t t) {
-                grpc_video_callback(w, h, codec, d, s, ls, t, capture_data);
+                // 視訊: 只有當 SRT 未連接時才使用 gRPC
+                if (!capture_data->srt_client || !capture_data->srt_client->isReceiving()) {
+                    grpc_video_callback(w, h, codec, d, s, ls, t, capture_data);
+                }
             },
             [capture_data](uint32_t sr, uint32_t ch, const float* d, size_t s, uint64_t t) {
-                grpc_audio_callback(sr, ch, d, s, t, capture_data);
+                // 音訊: 只有當 SRT 未連接時才使用 gRPC
+                if (!capture_data->srt_client || !capture_data->srt_client->isReceiving()) {
+                    grpc_audio_callback(sr, ch, d, s, t, capture_data);
+                }
             })) {
-        blog(LOG_WARNING, "[Remote Source] Failed to start stream");
+        blog(LOG_WARNING, "[Remote Source] Failed to start gRPC stream");
         data->streaming.store(false);
-    } else {
-        blog(LOG_INFO, "[Remote Source] Stream started");
+        return;
     }
+    
+    blog(LOG_INFO, "[Remote Source] gRPC stream started");
+    
+    // 如果要使用 SRT，在背景嘗試連接
+    if (want_srt && srt_port > 0) {
+        std::thread([capture_data, srt_port, srt_latency_ms]() {
+            // 等待服務器 SRT 就緒（輪詢）
+            for (int retry = 0; retry < 10; retry++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                
+                if (!capture_data->streaming.load()) return;
+                
+                // 檢查 SRT 是否就緒
+                GrpcClient::SrtInfo srt_info;
+                if (capture_data->grpc_client->getSrtInfo(capture_data->session_id, srt_info)) {
+                    if (srt_info.ready) {
+                        blog(LOG_INFO, "[Remote Source] SRT server ready, attempting connection...");
+                        
+                        // 創建 SRT 客戶端並連接
+                        capture_data->srt_client = std::make_unique<SrtClient>();
+                        if (capture_data->srt_client->connect(
+                                capture_data->server_ip, srt_port, srt_latency_ms)) {
+                            
+                            blog(LOG_INFO, "[Remote Source] SRT client connected to %s:%d",
+                                 capture_data->server_ip.c_str(), srt_port);
+                            
+                            // 啟動 SRT 接收
+                            capture_data->srt_client->startReceive(
+                                [capture_data](const uint8_t* h264_data, size_t size, 
+                                               int64_t pts_us, bool is_keyframe) {
+                                    srt_video_callback(h264_data, size, pts_us, is_keyframe, capture_data);
+                                },
+                                [capture_data](const float* pcm_data, size_t samples,
+                                               uint32_t sample_rate, uint32_t channels,
+                                               int64_t pts_us) {
+                                    srt_audio_callback(pcm_data, samples, sample_rate, channels, 
+                                                        pts_us, capture_data);
+                                }
+                            );
+                            
+                            blog(LOG_INFO, "[Remote Source] SRT receive started");
+                            return;
+                        } else {
+                            blog(LOG_WARNING, "[Remote Source] SRT connect failed, continuing with gRPC");
+                            capture_data->srt_client.reset();
+                            return;
+                        }
+                    }
+                }
+                
+                blog(LOG_INFO, "[Remote Source] Waiting for SRT server... (%d/10)", retry + 1);
+            }
+            
+            blog(LOG_WARNING, "[Remote Source] SRT server not ready after timeout, using gRPC only");
+        }).detach();
+    }
+    
+    blog(LOG_INFO, "[Remote Source] Stream started (gRPC%s)", 
+         want_srt ? " + SRT pending" : " only");
 }
 
 static void stop_streaming(remote_source_data* data) {
@@ -395,6 +518,19 @@ static void stop_streaming(remote_source_data* data) {
     
     data->streaming.store(false);
     
+    // 停止 SRT 接收
+    if (data->srt_client) {
+        data->srt_client->stopReceive();
+        data->srt_client->disconnect();
+    }
+    
+    // 等待 SRT 接收線程結束
+    if (data->srt_receive_thread.joinable()) {
+        data->srt_receive_thread.join();
+    }
+    data->srt_client.reset();
+    
+    // 停止 gRPC stream
     if (data->grpc_client) {
         data->grpc_client->stopStream();
     }

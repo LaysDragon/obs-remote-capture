@@ -124,6 +124,18 @@ message IsAudioActiveResponse {
   bool audio_active = 1;
 }
 
+// SRT 串流資訊查詢
+message GetSrtInfoRequest {
+  string session_id = 1;
+}
+
+message SrtInfo {
+  int32 port = 1;           // SRT 連接 Port
+  int32 latency_ms = 2;     // 延遲設定 (ms)
+  string passphrase = 3;    // 加密密碼 (可選)
+  bool ready = 4;           // 是否就緒
+}
+
 // ========== 串流數據 ==========
 
 // 視頻幀
@@ -172,4 +184,7 @@ service RemoteCaptureService {
   
   // 音頻狀態查詢 (延遲調用)
   rpc IsAudioActive(IsAudioActiveRequest) returns (IsAudioActiveResponse);
+  
+  // SRT 串流資訊
+  rpc GetSrtInfo(GetSrtInfoRequest) returns (SrtInfo);
 }

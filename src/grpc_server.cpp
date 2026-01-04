@@ -54,6 +54,7 @@ using namespace obsremote;
 #include <QString>
 
 #include "flow_meter.h"
+#include "srt_transport.h"
 
 // ========== 前向聲明 ==========
 static bool is_audio_active(obs_source_t* source);
@@ -92,6 +93,11 @@ struct Session {
     
     // 流量計 ID
     uint64_t stream_id{0};
+    
+    // SRT 傳輸
+    std::unique_ptr<SrtServer> srt_server;
+    int srt_port = 0;
+    bool use_srt = true;  // 是否使用 SRT (vs gRPC fallback)
 };
 
 // 全局 session 管理
@@ -392,16 +398,27 @@ public:
         
         std::string session_id = generate_uuid();
         
+        // SRT port 分配 (從 44556 開始)
+        static std::atomic<int> srt_port_counter{44556};
+        int srt_port = srt_port_counter++;
+        
         {
             std::lock_guard<std::mutex> lock(g_sessions_mutex);
             auto session = std::make_unique<Session>();
             session->id = session_id;
             session->encoder = std::make_unique<FFmpegEncoder>();
+            
+            // 初始化 SRT Server
+            session->srt_port = srt_port;
+            session->srt_server = std::make_unique<SrtServer>();
+            // SRT 會在 StartStream 時啟動，這裡只分配 port
+            
             g_sessions[session_id] = std::move(session);
         }
         
         response->set_session_id(session_id);
-        blog(LOG_INFO, "[gRPC Server] CreateSession: %s", session_id.c_str());
+        blog(LOG_INFO, "[gRPC Server] CreateSession: %s (SRT port: %d)", 
+             session_id.c_str(), srt_port);
         return Status::OK;
     }
     
@@ -423,6 +440,11 @@ public:
                 
                 // 停止串流
                 session->streaming.store(false);
+                
+                // 停止 SRT Server
+                if (session->srt_server) {
+                    session->srt_server->stop();
+                }
                 
                 // 釋放 source
                 if (session->capture_source) {
@@ -629,6 +651,32 @@ public:
         return Status::OK;
     }
     
+    // 獲取 SRT 串流資訊
+    Status GetSrtInfo(ServerContext* context,
+                      const GetSrtInfoRequest* request,
+                      obsremote::SrtInfo* response) override {
+        UNUSED_PARAMETER(context);
+        
+        const std::string& session_id = request->session_id();
+        
+        std::lock_guard<std::mutex> lock(g_sessions_mutex);
+        auto it = g_sessions.find(session_id);
+        if (it == g_sessions.end()) {
+            return Status(grpc::StatusCode::NOT_FOUND, "Session not found");
+        }
+        
+        Session* session = it->second.get();
+        
+        response->set_port(session->srt_port);
+        response->set_latency_ms(200);  // 預設 200ms
+        response->set_passphrase("");   // 暫不使用加密
+        response->set_ready(session->srt_server && session->srt_server->isRunning());
+        
+        blog(LOG_INFO, "[gRPC Server] GetSrtInfo: session=%s, port=%d, ready=%d",
+             session_id.c_str(), session->srt_port, response->ready());
+        return Status::OK;
+    }
+    
     // 開始串流
     Status StartStream(ServerContext* context,
                        const StartStreamRequest* request,
@@ -654,7 +702,24 @@ public:
         session->writer = writer;
         session->stream_id = g_flow_meter.registerStream();
         
-        blog(LOG_INFO, "[gRPC Server] Stream started for session %s", session_id.c_str());
+        // 啟動 SRT Server (如果尚未啟動)
+        bool use_srt = session->use_srt && session->srt_server;
+        if (use_srt && !session->srt_server->isRunning()) {
+            // 獲取視訊尺寸
+            uint32_t width = session->width > 0 ? session->width : 1920;
+            uint32_t height = session->height > 0 ? session->height : 1080;
+            
+            if (session->srt_server->start(session->srt_port, 200, width, height, 30)) {
+                blog(LOG_INFO, "[gRPC Server] SRT Server started on port %d for session %s",
+                     session->srt_port, session_id.c_str());
+            } else {
+                blog(LOG_WARNING, "[gRPC Server] Failed to start SRT, falling back to gRPC");
+                use_srt = false;
+            }
+        }
+        
+        blog(LOG_INFO, "[gRPC Server] Stream started for session %s (SRT: %s)", 
+             session_id.c_str(), use_srt ? "enabled" : "disabled");
         
         // 串流迴圈 - 性能測量變數
         int64_t max_encode_ms = 0;
@@ -674,18 +739,40 @@ public:
             
             int64_t network_ms = 0;
             if (captured) {
-                StreamFrame frame;
-                *frame.mutable_video() = video;
-                
-                std::lock_guard<std::mutex> lock(session->writer_mutex);
-                
                 auto t_before_write = std::chrono::steady_clock::now();
-                if (writer->Write(frame)) {
-                    g_flow_meter.addBytes(session->stream_id, frame.ByteSizeLong());
+                bool write_success = false;
+                
+                // 優先使用 SRT
+                if (use_srt && session->srt_server && session->srt_server->hasClient()) {
+                    // 通過 SRT 發送 (直接發送 H.264 數據)
+                    int64_t pts_us = video.timestamp_ns() / 1000;
+                    bool is_keyframe = (video.frame_number() % 30 == 0);  // 假設每 30 幀一個 keyframe
+                    
+                    write_success = session->srt_server->sendVideoFrame(
+                        (const uint8_t*)video.frame_data().data(),
+                        video.frame_data().size(),
+                        pts_us, is_keyframe);
+                    
+                    if (write_success) {
+                        g_flow_meter.addBytes(session->stream_id, video.frame_data().size());
+                    }
                 } else {
+                    // Fallback: 通過 gRPC 發送
+                    StreamFrame frame;
+                    *frame.mutable_video() = video;
+                    
+                    std::lock_guard<std::mutex> lock(session->writer_mutex);
+                    write_success = writer->Write(frame);
+                    if (write_success) {
+                        g_flow_meter.addBytes(session->stream_id, frame.ByteSizeLong());
+                    }
+                }
+                
+                if (!write_success) {
                     blog(LOG_WARNING, "[gRPC Server] Failed to write video frame");
                     break;
                 }
+                
                 auto t_after_write = std::chrono::steady_clock::now();
                 network_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     t_after_write - t_before_write).count();
@@ -707,8 +794,9 @@ public:
                 if (perf_frame_count % 30 == 0) {
                     int64_t avg_encode = total_encode_ms / 30;
                     int64_t avg_network = total_network_ms / 30;
-                    blog(LOG_INFO, "[Perf] Session %s: encode avg=%lldms max=%lldms, network avg=%lldms max=%lldms",
-                         session->id.c_str(), avg_encode, max_encode_ms, avg_network, max_network_ms);
+                    blog(LOG_INFO, "[Perf] Session %s: encode avg=%lldms max=%lldms, network avg=%lldms max=%lldms (SRT: %s)",
+                         session->id.c_str(), avg_encode, max_encode_ms, avg_network, max_network_ms,
+                         (use_srt && session->srt_server && session->srt_server->hasClient()) ? "active" : "inactive");
                     // 重置統計
                     total_encode_ms = 0;
                     total_network_ms = 0;
@@ -721,14 +809,35 @@ public:
             {
                 std::lock_guard<std::mutex> lock(session->audio_mutex);
                 while (!session->audio_queue.empty()) {
-                    StreamFrame audio_frame;
-                    *audio_frame.mutable_audio() = std::move(session->audio_queue.front());
+                    AudioFrame& audio = session->audio_queue.front();
+                    bool audio_success = false;
+                    
+                    // 優先使用 SRT
+                    if (use_srt && session->srt_server && session->srt_server->hasClient()) {
+                        // 通過 SRT 發送音訊
+                        int64_t pts_us = audio.timestamp_ns() / 1000;
+                        const float* pcm_data = reinterpret_cast<const float*>(audio.frame_data().data());
+                        size_t samples = audio.frame_data().size() / (2 * sizeof(float));  // planar stereo
+                        
+                        audio_success = session->srt_server->sendAudioFrame(
+                            pcm_data, samples,
+                            audio.sample_rate(), audio.channels(),
+                            pts_us);
+                    } else {
+                        // Fallback: 通過 gRPC 發送
+                        StreamFrame audio_frame;
+                        *audio_frame.mutable_audio() = std::move(audio);
+                        
+                        std::lock_guard<std::mutex> wlock(session->writer_mutex);
+                        audio_success = writer->Write(audio_frame);
+                        if (audio_success) {
+                            g_flow_meter.addBytes(session->stream_id, audio_frame.ByteSizeLong());
+                        }
+                    }
+                    
                     session->audio_queue.pop();
                     
-                    std::lock_guard<std::mutex> wlock(session->writer_mutex);
-                    if (writer->Write(audio_frame)) {
-                        g_flow_meter.addBytes(session->stream_id, audio_frame.ByteSizeLong());
-                    } else {
+                    if (!audio_success) {
                         break;
                     }
                 }
@@ -742,6 +851,9 @@ public:
         session->streaming.store(false);
         session->writer = nullptr;
         g_flow_meter.unregisterStream(session->stream_id);
+        
+        // 停止 SRT (保持 server 運行以便下次重連)
+        // session->srt_server->stop();  // 暫不停止，允許客戶端重連
         
         blog(LOG_INFO, "[gRPC Server] Stream stopped for session %s", session_id.c_str());
         return Status::OK;

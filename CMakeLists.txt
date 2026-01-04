@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/codec_ffmpeg.cpp
   src/flow_meter.cpp
   src/session_monitor.cpp
+  src/srt_transport.cpp
 )
 
 # ========== Windows 系統庫 ==========
@@ -83,6 +84,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIB_DIR})
 # 連結 FFmpeg 庫（靜態連結需要連結依賴庫）
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
   avcodec
+  avformat
   avutil
   swscale
 )
@@ -93,6 +95,7 @@ if(WIN32)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
     libx264      # x264 編碼器
     libmfx       # Intel QSV (Quick Sync Video)
+    srt          # SRT (Secure Reliable Transport)
     # Windows 系統庫 (Media Foundation)
     mfplat
     mfuuid
@@ -100,6 +103,10 @@ if(WIN32)
     ole32
     uuid
     bcrypt
+    # Windows 系統庫 (SRT/TLS 依賴)
+    Secur32      # Security API (TLS)
+    Crypt32      # Crypto API
+    ws2_32       # Winsock
   )
 endif()
 

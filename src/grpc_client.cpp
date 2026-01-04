@@ -255,6 +255,32 @@ public:
         return true;
     }
     
+    // 獲取 SRT 串流資訊
+    bool GetSrtInfo(const std::string& session_id, GrpcClient::SrtInfo& out_info) {
+        GetSrtInfoRequest request;
+        request.set_session_id(session_id);
+        
+        obsremote::SrtInfo response;
+        ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+        
+        Status status = stub_->GetSrtInfo(&context, request, &response);
+        if (!status.ok()) {
+            blog(LOG_WARNING, "[gRPC Client] GetSrtInfo failed: %s", 
+                 status.error_message().c_str());
+            return false;
+        }
+        
+        out_info.port = response.port();
+        out_info.latency_ms = response.latency_ms();
+        out_info.passphrase = response.passphrase();
+        out_info.ready = response.ready();
+        
+        blog(LOG_INFO, "[gRPC Client] GetSrtInfo: session=%s, port=%d, ready=%d", 
+             session_id.c_str(), out_info.port, out_info.ready);
+        return true;
+    }
+    
     // 開始接收串流
     bool StartStream(const std::string& session_id,
                      GrpcClient::VideoCallback on_video,
@@ -406,6 +432,10 @@ bool GrpcClient::getProperties(const std::string& session_id,
 
 bool GrpcClient::isAudioActive(const std::string& session_id, bool& out_audio_active) {
     return impl_->IsAudioActive(session_id, out_audio_active);
+}
+
+bool GrpcClient::getSrtInfo(const std::string& session_id, SrtInfo& out_info) {
+    return impl_->GetSrtInfo(session_id, out_info);
 }
 
 bool GrpcClient::startStream(const std::string& session_id,
