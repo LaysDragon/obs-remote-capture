@@ -62,16 +62,20 @@ public:
     }
     
     void stop() {
+        blog(LOG_INFO, "[SRT Server] Stopping");
         if (!running_.load()) return;
         
         running_.store(false);
         queue_cv_.notify_all();
         
+        // 先關閉 I/O 以中斷可能阻塞的 avio_open2 或 write 操作
+        closeOutput();
+        blog(LOG_INFO, "[SRT Server] Closed output");
+        
         if (send_thread_.joinable()) {
             send_thread_.join();
         }
-        
-        closeOutput();
+        blog(LOG_INFO, "[SRT Server] Send thread stopped");
         
         info_.ready = false;
         blog(LOG_INFO, "[SRT Server] Stopped");
@@ -264,15 +268,24 @@ private:
             audio_stream_ = nullptr;
         }
         
-        // 設置 SRT 選項
+        // 設置 SRT 選項 - 加入 timeout 避免無限阻塞
         AVDictionary* opts = nullptr;
         av_dict_set(&opts, "mode", "listener", 0);
         av_dict_set_int(&opts, "latency", latency_ms_ * 1000, 0);
+        av_dict_set_int(&opts, "timeout", 3000000, 0);  // 3 秒超時 (微秒)
+        av_dict_set_int(&opts, "listen_timeout", 3000, 0);  // 3 秒監聽超時 (毫秒)
         
-        // 打開輸出 (這會阻塞直到有客戶端連接)
+        // 打開輸出 (這會阻塞直到有客戶端連接或超時)
         blog(LOG_INFO, "[SRT Server] Waiting for client connection on %s...", srt_url_.c_str());
         ret = avio_open2(&fmt_ctx_->pb, srt_url_.c_str(), AVIO_FLAG_WRITE, nullptr, &opts);
         av_dict_free(&opts);
+        
+        // 檢查是否被要求停止
+        if (!running_.load()) {
+            blog(LOG_INFO, "[SRT Server] Stop requested during connection");
+            closeOutput();
+            return false;
+        }
         
         if (ret < 0) {
             char err[AV_ERROR_MAX_STRING_SIZE];

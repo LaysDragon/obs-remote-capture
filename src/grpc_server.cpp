@@ -58,7 +58,7 @@ using namespace obsremote;
 
 // ========== 前向聲明 ==========
 static bool is_audio_active(obs_source_t* source);
-
+static bool check_session_lock(const char* msg);
 // ========== Session 結構 ==========
 struct Session {
     std::string id;
@@ -432,37 +432,51 @@ public:
         const std::string& session_id = request->session_id();
         blog(LOG_INFO, "[gRPC Server] ReleaseSession: %s", session_id.c_str());
         
+        // 先從 map 取出 session，不要在持有 mutex 時做阻塞操作
+        std::unique_ptr<Session> session_to_release;
         {
+            check_session_lock("ReleaseSession");
             std::lock_guard<std::mutex> lock(g_sessions_mutex);
             auto it = g_sessions.find(session_id);
             if (it != g_sessions.end()) {
-                Session* session = it->second.get();
-                
-                // 停止串流
-                session->streaming.store(false);
-                
-                // 停止 SRT Server
-                if (session->srt_server) {
-                    session->srt_server->stop();
-                }
-                
-                // 釋放 source
-                if (session->capture_source) {
-                    obs_source_remove_audio_capture_callback(session->capture_source, 
-                        grpc_audio_callback, session);
-                    obs_source_dec_active(session->capture_source);
-                    obs_source_dec_showing(session->capture_source);
-                    obs_source_release(session->capture_source);
-                }
-                
-                // 釋放渲染資源
-                obs_enter_graphics();
-                if (session->texrender) gs_texrender_destroy(session->texrender);
-                if (session->stagesurface) gs_stagesurface_destroy(session->stagesurface);
-                obs_leave_graphics();
-                
+                session_to_release = std::move(it->second);
                 g_sessions.erase(it);
             }
+        }
+        
+        // 在 mutex 外面進行清理操作
+        if (session_to_release) {
+            Session* session = session_to_release.get();
+            
+            // 停止串流
+            session->streaming.store(false);
+            blog(LOG_INFO, "[gRPC Server] ReleaseSession: %s (streaming stopped)", 
+                session_id.c_str());
+                
+            // 停止 SRT Server (可能會阻塞)
+            if (session->srt_server) {
+                session->srt_server->stop();
+                session->srt_server.reset();
+            }
+            blog(LOG_INFO, "[gRPC Server] ReleaseSession: %s (SRT stopped)", 
+                session_id.c_str());
+                    
+            // 釋放 source
+            if (session->capture_source) {
+                obs_source_remove_audio_capture_callback(session->capture_source, 
+                    grpc_audio_callback, session);
+                obs_source_dec_active(session->capture_source);
+                obs_source_dec_showing(session->capture_source);
+                obs_source_release(session->capture_source);
+            }
+            
+            // 釋放渲染資源
+            obs_enter_graphics();
+            if (session->texrender) gs_texrender_destroy(session->texrender);
+            if (session->stagesurface) gs_stagesurface_destroy(session->stagesurface);
+            obs_leave_graphics();
+            
+            blog(LOG_INFO, "[gRPC Server] ReleaseSession: %s (complete)", session_id.c_str());
         }
         
         return Status::OK;
@@ -936,40 +950,44 @@ void obs_grpc_server_start(void) {
 
 void obs_grpc_server_stop(void) {
     if (!g_running.load()) return;
-    
+    blog(LOG_INFO, "[gRPC Server] Stopping");
     g_running.store(false);
     
     // 停止 tick 線程
     if (g_tick_thread.joinable()) {
         g_tick_thread.join();
+        blog(LOG_INFO, "[gRPC Server] Stopped tick thread");
     }
     
     // 釋放所有 session
     {
+        check_session_lock("stoping grpc");
         std::lock_guard<std::mutex> lock(g_sessions_mutex);
         for (auto& pair : g_sessions) {
             Session* session = pair.second.get();
-            session->streaming.store(false);
-            
-            // 先停止 SRT server，避免它繼續存取音訊數據
-            if (session->srt_server) {
-                session->srt_server->stop();
-                session->srt_server.reset();
-            }
-            
-            if (session->capture_source) {
-                obs_source_remove_audio_capture_callback(session->capture_source,
-                    grpc_audio_callback, session);
-                obs_source_dec_active(session->capture_source);
-                obs_source_dec_showing(session->capture_source);
-                obs_source_release(session->capture_source);
-            }
-            
-            obs_enter_graphics();
-            if (session->texrender) gs_texrender_destroy(session->texrender);
-            if (session->stagesurface) gs_stagesurface_destroy(session->stagesurface);
-            obs_leave_graphics();
+        session->streaming.store(false);
+        
+        // 先停止 SRT server
+        if (session->srt_server) {
+            session->srt_server->stop();
+            session->srt_server.reset();
+            blog(LOG_INFO, "[gRPC Server] Stopped SRT server");
         }
+        
+        if (session->capture_source) {
+            obs_source_remove_audio_capture_callback(session->capture_source,
+                grpc_audio_callback, session);
+            obs_source_dec_active(session->capture_source);
+            obs_source_dec_showing(session->capture_source);
+            obs_source_release(session->capture_source);
+            blog(LOG_INFO, "[gRPC Server] Stopped capture source");
+        }
+        
+        obs_enter_graphics();
+        if (session->texrender) gs_texrender_destroy(session->texrender);
+        if (session->stagesurface) gs_stagesurface_destroy(session->stagesurface);
+        obs_leave_graphics();
+    }
         g_sessions.clear();
     }
     
@@ -1027,4 +1045,16 @@ static bool is_audio_active(obs_source_t* source) {
     //OBS_SOURCE_AUDIO log
     blog(LOG_INFO, "[gRPC Server] is_audio_active: %s, no OBS_SOURCE_AUDIO flag", obs_source_get_name(source));
     return false;
+}
+
+//check sesion lock
+static bool check_session_lock(const char* msg) {
+    //print if mutex is lock
+    if (g_sessions_mutex.try_lock()) {
+        g_sessions_mutex.unlock();
+        return true;
+    }else{
+        blog(LOG_INFO, "[gRPC Server] %s, g_sessions_mutex is locked", msg);
+        return false;
+    }
 }
