@@ -95,14 +95,14 @@ public:
     bool hasClient() const { return has_client_.load(); }
     SrtConnectionInfo getInfo() const { return info_; }
     
-    bool sendVideoFrame(const uint8_t* data, size_t size, int64_t pts_us, bool is_keyframe) {
+    bool sendVideoFrame(const uint8_t* data, size_t size, int64_t pts_ns, bool is_keyframe) {
         if (!running_.load()) return false;
         
         // 複製數據到隊列
         FrameData frame;
         frame.type = FRAME_VIDEO;
         frame.data.assign(data, data + size);
-        frame.pts_us = pts_us;
+        frame.pts_ns = pts_ns;
         frame.is_keyframe = is_keyframe;
         
         {
@@ -117,7 +117,7 @@ public:
     }
     
     bool sendAudioFrame(const float* data, size_t samples, 
-                        uint32_t sample_rate, uint32_t channels, int64_t pts_us) {
+                        uint32_t sample_rate, uint32_t channels, int64_t pts_ns) {
         if (!running_.load()) return false;
         
         // 直接複製 float planar 數據，前面加上 header
@@ -127,7 +127,7 @@ public:
         frame.samples = samples;
         frame.sample_rate = sample_rate;
         frame.channels = channels;
-        frame.pts_us = pts_us;
+        frame.pts_ns = pts_ns;
         
         // 計算數據大小: header + float data
         size_t header_size = 3 * sizeof(uint32_t);  // 12 bytes
@@ -164,7 +164,7 @@ private:
         size_t samples = 0;
         uint32_t sample_rate = 0;
         uint32_t channels = 0;
-        int64_t pts_us = 0;
+        int64_t pts_ns = 0;  // 納秒
         bool is_keyframe = false;
     };
     
@@ -260,7 +260,7 @@ private:
         video_stream_->codecpar->width = width_;
         video_stream_->codecpar->height = height_;
         video_stream_->codecpar->format = AV_PIX_FMT_YUV420P;
-        video_stream_->time_base = AVRational{1, 1000000};  // 微秒
+        video_stream_->time_base = AVRational{1, 1000000000};  // 納秒
         
         // 添加音訊流 (PCM S16LE)
         const AVCodec* audio_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
@@ -274,7 +274,7 @@ private:
                 // 使用新的 channel layout API
                 av_channel_layout_default(&audio_stream_->codecpar->ch_layout, 2);
                 audio_stream_->codecpar->format = AV_SAMPLE_FMT_S16;
-                audio_stream_->time_base = AVRational{1, 48000};
+                audio_stream_->time_base = AVRational{1, 1000000000};  // 納秒
                 blog(LOG_INFO, "[SRT Server] Audio stream created with PCM S16LE");
             }
         } else {
@@ -347,7 +347,7 @@ private:
         
         pkt->data = (uint8_t*)frame.data.data();
         pkt->size = (int)frame.data.size();
-        pkt->pts = av_rescale_q(frame.pts_us, AVRational{1, 1000000}, video_stream_->time_base);
+        pkt->pts = av_rescale_q(frame.pts_ns, AVRational{1, 1000000000}, video_stream_->time_base);
         pkt->dts = pkt->pts;
         pkt->stream_index = video_stream_->index;
         if (frame.is_keyframe) {
@@ -368,7 +368,7 @@ private:
         
         pkt->data = (uint8_t*)frame.audio_raw.data();
         pkt->size = (int)frame.audio_raw.size();
-        pkt->pts = av_rescale_q(frame.pts_us, AVRational{1, 1000000}, audio_stream_->time_base);
+        pkt->pts = av_rescale_q(frame.pts_ns, AVRational{1, 1000000000}, audio_stream_->time_base);
         pkt->dts = pkt->pts;
         pkt->stream_index = audio_stream_->index;
         
@@ -416,13 +416,13 @@ bool SrtServer::isRunning() const { return impl_->isRunning(); }
 bool SrtServer::hasClient() const { return impl_->hasClient(); }
 SrtConnectionInfo SrtServer::getInfo() const { return impl_->getInfo(); }
 
-bool SrtServer::sendVideoFrame(const uint8_t* data, size_t size, int64_t pts_us, bool is_keyframe) {
-    return impl_->sendVideoFrame(data, size, pts_us, is_keyframe);
+bool SrtServer::sendVideoFrame(const uint8_t* data, size_t size, int64_t pts_ns, bool is_keyframe) {
+    return impl_->sendVideoFrame(data, size, pts_ns, is_keyframe);
 }
 
 bool SrtServer::sendAudioFrame(const float* data, size_t samples,
-                                uint32_t sample_rate, uint32_t channels, int64_t pts_us) {
-    return impl_->sendAudioFrame(data, samples, sample_rate, channels, pts_us);
+                                uint32_t sample_rate, uint32_t channels, int64_t pts_ns) {
+    return impl_->sendAudioFrame(data, samples, sample_rate, channels, pts_ns);
 }
 
 
@@ -581,13 +581,13 @@ private:
             
             if (pkt->stream_index == video_stream_idx_ && on_video_) {
                 AVStream* st = fmt_ctx_->streams[video_stream_idx_];
-                int64_t pts_us = av_rescale_q(pkt->pts, st->time_base, AVRational{1, 1000000});
+                int64_t pts_ns = av_rescale_q(pkt->pts, st->time_base, AVRational{1, 1000000000});
                 bool is_keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
                 
-                on_video_(pkt->data, pkt->size, pts_us, is_keyframe);
+                on_video_(pkt->data, pkt->size, pts_ns, is_keyframe);
             } else if (pkt->stream_index == audio_stream_idx_ && on_audio_) {
                 AVStream* st = fmt_ctx_->streams[audio_stream_idx_];
-                int64_t pts_us = av_rescale_q(pkt->pts, st->time_base, AVRational{1, 1000000});
+                int64_t pts_ns = av_rescale_q(pkt->pts, st->time_base, AVRational{1, 1000000000});
                 
                 // 解析 header: [sample_rate: 4B][channels: 4B][samples: 4B]
                 const size_t header_size = 3 * sizeof(uint32_t);  // 12 bytes
@@ -614,7 +614,7 @@ private:
                 // 直接使用 float planar 數據
                 const float* float_data = (const float*)(pkt->data + header_size);
                 
-                on_audio_(float_data, samples, sample_rate, channels, pts_us);
+                on_audio_(float_data, samples, sample_rate, channels, pts_ns);
             }
             
             av_packet_unref(pkt);

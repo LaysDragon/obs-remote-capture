@@ -58,20 +58,20 @@ public:
     // 發送視訊幀 (已編碼的 H.264 NAL units)
     // @param data H.264 編碼數據
     // @param size 數據大小
-    // @param pts_us 顯示時間戳 (微秒)
+    // @param pts_ns 顯示時間戳 (納秒)
     // @param is_keyframe 是否為關鍵幀
     bool sendVideoFrame(const uint8_t* data, size_t size, 
-                        int64_t pts_us, bool is_keyframe = false);
+                        int64_t pts_ns, bool is_keyframe = false);
     
     // 發送音訊幀 (PCM Float Planar)
     // @param data 音訊數據 (planar float, L|R)
     // @param samples 每聲道樣本數
     // @param sample_rate 採樣率
     // @param channels 聲道數
-    // @param pts_us 顯示時間戳 (微秒)
+    // @param pts_ns 顯示時間戳 (納秒)
     bool sendAudioFrame(const float* data, size_t samples,
                         uint32_t sample_rate, uint32_t channels, 
-                        int64_t pts_us);
+                        int64_t pts_ns);
     
     // 獲取連接資訊
     SrtConnectionInfo getInfo() const;
@@ -87,12 +87,12 @@ public:
     // 回調類型定義
     using VideoCallback = std::function<void(
         const uint8_t* h264_data, size_t size,
-        int64_t pts_us, bool is_keyframe)>;
+        int64_t pts_ns, bool is_keyframe)>;
     
     using AudioCallback = std::function<void(
         const float* pcm_data, size_t samples,
         uint32_t sample_rate, uint32_t channels,
-        int64_t pts_us)>;
+        int64_t pts_ns)>;
     
     SrtClient();
     ~SrtClient();

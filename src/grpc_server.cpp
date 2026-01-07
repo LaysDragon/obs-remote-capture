@@ -94,6 +94,9 @@ struct Session {
     // 流量計 ID
     uint64_t stream_id{0};
     
+    // 串流開始時間 (用於計算相對時間戳)
+    std::chrono::steady_clock::time_point stream_start_time{};
+    
     // SRT 傳輸
     std::unique_ptr<SrtServer> srt_server;
     int srt_port = 0;
@@ -221,7 +224,11 @@ static void grpc_audio_callback(void* param, obs_source_t* source,
     AudioFrame frame;
     frame.set_sample_rate(48000);
     frame.set_channels(2);
-    frame.set_timestamp_ns(os_gettime_ns());
+    // 使用相對時間戳 (從 stream 開始的偏移量，納秒)
+    auto now = std::chrono::steady_clock::now();
+    int64_t relative_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now - session->stream_start_time).count();
+    frame.set_timestamp_ns(relative_ns);
     
     // 計算每個 plane 的數據大小
     size_t plane_size = audio->frames * sizeof(float);
@@ -326,6 +333,11 @@ static bool capture_video_frame(Session* session, VideoFrame* out_frame) {
         
         obs_source_video_render(session->capture_source);
         gs_texrender_end(session->texrender);
+        // 使用相對時間戳 (從 stream 開始的偏移量，納秒)
+        auto now = std::chrono::steady_clock::now();
+        int64_t relative_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - session->stream_start_time).count();
+        out_frame->set_timestamp_ns(relative_ns);
     }
     
     // 複製到 staging surface
@@ -339,14 +351,13 @@ static bool capture_video_frame(Session* session, VideoFrame* out_frame) {
         uint32_t linesize;
         if (gs_stagesurface_map(session->stagesurface, &data, &linesize)) {
             // 使用 H.264 編碼器
-            if (session->encoder) {
+            if (session->encoder) { 
                 std::vector<uint8_t> encoded_data;
                 if (session->encoder->encode(data, width, height, linesize, encoded_data)) {
                     out_frame->set_width(width);
                     out_frame->set_height(height);
                     out_frame->set_codec(VideoCodec::CODEC_H264);
                     out_frame->set_frame_data(encoded_data.data(), encoded_data.size());
-                    out_frame->set_timestamp_ns(os_gettime_ns());
                     out_frame->set_frame_number(session->frame_number++);
                     success = true;
                 }
@@ -713,6 +724,7 @@ public:
         }
         
         session->streaming.store(true);
+        session->stream_start_time = std::chrono::steady_clock::now();  // 記錄串流開始時間
         session->writer = writer;
         session->stream_id = g_flow_meter.registerStream();
         
@@ -759,13 +771,13 @@ public:
                 // 優先使用 SRT
                 if (use_srt && session->srt_server && session->srt_server->hasClient()) {
                     // 通過 SRT 發送 (直接發送 H.264 數據)
-                    int64_t pts_us = video.timestamp_ns() / 1000;
+                    int64_t pts_ns = video.timestamp_ns();  // 直接使用納秒
                     bool is_keyframe = (video.frame_number() % 30 == 0);  // 假設每 30 幀一個 keyframe
                     
                     write_success = session->srt_server->sendVideoFrame(
                         (const uint8_t*)video.frame_data().data(),
                         video.frame_data().size(),
-                        pts_us, is_keyframe);
+                        pts_ns, is_keyframe);
                     
                     if (write_success) {
                         g_flow_meter.addBytes(session->stream_id, video.frame_data().size());
@@ -829,14 +841,14 @@ public:
                     // 優先使用 SRT
                     if (use_srt && session->srt_server && session->srt_server->hasClient()) {
                         // 通過 SRT 發送音訊
-                        int64_t pts_us = audio.timestamp_ns() / 1000;
+                        int64_t pts_ns = audio.timestamp_ns();
                         const float* pcm_data = reinterpret_cast<const float*>(audio.frame_data().data());
                         size_t samples = audio.frame_data().size() / (2 * sizeof(float));  // planar stereo
                         
                         audio_success = session->srt_server->sendAudioFrame(
                             pcm_data, samples,
                             audio.sample_rate(), audio.channels(),
-                            pts_us);
+                            pts_ns);
                     } else {
                         // Fallback: 通過 gRPC 發送
                         StreamFrame audio_frame;

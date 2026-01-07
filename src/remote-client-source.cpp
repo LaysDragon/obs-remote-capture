@@ -208,12 +208,18 @@ static void disconnect_and_release_session(remote_source_data* data) {
 // 客戶端性能測量變數 (static 保持跨幀狀態)
 static struct {
     std::chrono::steady_clock::time_point last_recv_time{};
+    // 串流開始時間 (第一幀收到時設定)
+    std::chrono::steady_clock::time_point stream_start{};
+    bool stream_started = false;
+    
     int64_t max_recv_interval_ms = 0;
     int64_t max_decode_ms = 0;
     int64_t max_recv_to_ready_ms = 0;  // 從接收到解碼完成的本地延遲
+    int64_t max_e2e_ms = 0;            // E2E: 從重建的捕獲時間到解碼完成
     int64_t total_recv_interval_ms = 0;
     int64_t total_decode_ms = 0;
     int64_t total_recv_to_ready_ms = 0;
+    int64_t total_e2e_ms = 0;
     uint32_t perf_frame_count = 0;
 } client_perf;
 
@@ -227,6 +233,13 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
     if (!data) return;
     
     auto recv_time = std::chrono::steady_clock::now();
+    
+    // 記錄串流開始時間 (第一幀)
+    // stream_start = 第一幀到達時間 - 第一幀的 PTS = 虛擬的串流起點
+    if (!client_perf.stream_started && timestamp_ns > 0) {
+        client_perf.stream_start = recv_time - std::chrono::nanoseconds(timestamp_ns);
+        client_perf.stream_started = true;
+    }
     
     static uint32_t callback_count = 0;
     callback_count++;
@@ -273,34 +286,58 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
         int64_t recv_to_ready_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             decode_end - recv_time).count();
         
+        // E2E 延遲計算
+        // 重建捕獲時間 = stream_start + pts (pts 是 server 端的相對時間)
+        // e2e = 解碼完成時間 - 重建捕獲時間
+
+        int64_t e2e_ms = 0;
+        if (timestamp_ns > 0 && client_perf.stream_started) {
+            auto reconstructed_capture = client_perf.stream_start + 
+                std::chrono::nanoseconds(timestamp_ns);
+            e2e_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                decode_end - reconstructed_capture).count();
+
+            // blog(LOG_INFO, "timestamp_ns: %ld",timestamp_ns);
+            // blog(LOG_INFO, "client_perf.stream_started: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(client_perf.stream_start.time_since_epoch()).count());
+            // blog(LOG_INFO, "reconstructed_capture: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(reconstructed_capture.time_since_epoch()).count());
+            // blog(LOG_INFO, "decode_end: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(decode_end.time_since_epoch()).count());
+        }
+        
         // 更新統計
         client_perf.perf_frame_count++;
         client_perf.total_recv_interval_ms += recv_interval_ms;
         client_perf.total_decode_ms += decode_ms;
         client_perf.total_recv_to_ready_ms += recv_to_ready_ms;
+        client_perf.total_e2e_ms += e2e_ms;
         if (recv_interval_ms > client_perf.max_recv_interval_ms) 
             client_perf.max_recv_interval_ms = recv_interval_ms;
         if (decode_ms > client_perf.max_decode_ms) 
             client_perf.max_decode_ms = decode_ms;
         if (recv_to_ready_ms > client_perf.max_recv_to_ready_ms) 
             client_perf.max_recv_to_ready_ms = recv_to_ready_ms;
+        if (e2e_ms > client_perf.max_e2e_ms) 
+            client_perf.max_e2e_ms = e2e_ms;
         
         // 每 30 幀輸出統計
         if (client_perf.perf_frame_count % 30 == 0) {
             int64_t avg_recv = client_perf.total_recv_interval_ms / 30;
             int64_t avg_decode = client_perf.total_decode_ms / 30;
             int64_t avg_ready = client_perf.total_recv_to_ready_ms / 30;
-            blog(LOG_INFO, "[Client Perf] recv_interval avg=%lldms max=%lldms, decode avg=%lldms max=%lldms, recv_to_ready avg=%lldms max=%lldms",
+            int64_t avg_e2e = client_perf.total_e2e_ms / 30;
+            blog(LOG_INFO, "[Client Perf] recv_interval avg=%lldms max=%lldms, decode avg=%lldms max=%lldms, recv_to_ready avg=%lldms max=%lldms, e2e avg=%lldms max=%lldms",
                  avg_recv, client_perf.max_recv_interval_ms,
                  avg_decode, client_perf.max_decode_ms,
-                 avg_ready, client_perf.max_recv_to_ready_ms);
+                 avg_ready, client_perf.max_recv_to_ready_ms,
+                 avg_e2e, client_perf.max_e2e_ms);
             // 重置統計
             client_perf.total_recv_interval_ms = 0;
             client_perf.total_decode_ms = 0;
             client_perf.total_recv_to_ready_ms = 0;
+            client_perf.total_e2e_ms = 0;
             client_perf.max_recv_interval_ms = 0;
             client_perf.max_decode_ms = 0;
             client_perf.max_recv_to_ready_ms = 0;
+            client_perf.max_e2e_ms = 0;
         }
         
         std::lock_guard<std::mutex> lock(data->video_mutex);
@@ -373,8 +410,7 @@ static void schedule_audio_active_check(remote_source_data* data) {
 
 // ========== SRT 回調函數 ==========
 static void srt_video_callback(const uint8_t* h264_data, size_t size,
-                                int64_t pts_us, bool is_keyframe, void* user_data) {
-    UNUSED_PARAMETER(pts_us);
+                                int64_t pts_ns, bool is_keyframe, void* user_data) {
     UNUSED_PARAMETER(is_keyframe);
     
     remote_source_data* data = (remote_source_data*)user_data;
@@ -384,19 +420,19 @@ static void srt_video_callback(const uint8_t* h264_data, size_t size,
     // 使用 gRPC 相同的視訊回調 (codec = H264)
     grpc_video_callback(0, 0, 2,  // codec = CODEC_H264 = 2
                         h264_data, size, 0, 
-                        pts_us * 1000,  // 轉換為 ns
+                        pts_ns,  // 已是納秒
                         user_data);
 }
 
 static void srt_audio_callback(const float* pcm_data, size_t samples,
                                 uint32_t sample_rate, uint32_t channels,
-                                int64_t pts_us, void* user_data) {
+                                int64_t pts_ns, void* user_data) {
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data || !data->streaming.load()) return;
     
     // 直接調用 gRPC 音訊回調
     grpc_audio_callback(sample_rate, channels, pcm_data, samples, 
-                        pts_us * 1000,  // 轉換為 ns
+                        pts_ns,  // 已是納秒
                         user_data);
 }
 
@@ -528,6 +564,11 @@ static void stop_streaming(remote_source_data* data) {
     if (data->grpc_client) {
         data->grpc_client->stopStream();
     }
+    
+    // 重置 perf 追蹤狀態 (下次連接時重新初始化)
+    client_perf.stream_started = false;
+    client_perf.stream_start = std::chrono::steady_clock::time_point{};
+    client_perf.last_recv_time = std::chrono::steady_clock::time_point{};
     
     blog(LOG_INFO, "[Remote Source] Stream stopped");
 }
