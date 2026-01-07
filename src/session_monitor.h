@@ -18,6 +18,7 @@ struct SessionStatus {
     std::string id;
     std::string source_type;
     std::string encoder_name;
+    std::string protocol;     // "SRT", "gRPC", or "-"
     bool streaming;
     uint64_t stream_id;       // FlowMeter stream ID
     uint32_t width;

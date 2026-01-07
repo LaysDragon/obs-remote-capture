@@ -42,9 +42,9 @@ SessionMonitorDock::SessionMonitorDock(QWidget* parent)
     
     // Session 表格
     table_ = new QTableWidget(container);
-    table_->setColumnCount(6);
+    table_->setColumnCount(7);
     table_->setHorizontalHeaderLabels({
-        "Session ID", "Source Type", "Encoder", "Size", "Frame", "Rate"
+        "Session ID", "Source Type", "Encoder", "Protocol", "Size", "Frame", "Rate"
     });
     table_->horizontalHeader()->setStretchLastSection(true);
     table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -95,14 +95,15 @@ void SessionMonitorDock::updateStatus() {
         table_->setItem(i, 0, new QTableWidgetItem(short_id));
         table_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(s.source_type)));
         table_->setItem(i, 2, new QTableWidgetItem(QString::fromStdString(s.encoder_name)));
-        table_->setItem(i, 3, new QTableWidgetItem(
+        table_->setItem(i, 3, new QTableWidgetItem(QString::fromStdString(s.protocol)));
+        table_->setItem(i, 4, new QTableWidgetItem(
             QString("%1x%2").arg(s.width).arg(s.height)));
-        table_->setItem(i, 4, new QTableWidgetItem(QString::number(s.frame_count)));
-        table_->setItem(i, 5, new QTableWidgetItem(FlowMeter::formatRate(rate)));
+        table_->setItem(i, 5, new QTableWidgetItem(QString::number(s.frame_count)));
+        table_->setItem(i, 6, new QTableWidgetItem(FlowMeter::formatRate(rate)));
         
         // 設定串流狀態顏色
         QColor row_color = s.streaming ? QColor(42, 176, 49) : QColor(199, 60, 50);
-        for (int j = 0; j < 6; j++) {
+        for (int j = 0; j < 7; j++) {
             if (table_->item(i, j)) {
                 table_->item(i, j)->setBackground(row_color);
             }

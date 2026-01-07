@@ -1017,6 +1017,16 @@ std::vector<SessionStatus> grpc_server_get_session_status() {
         status.id = s->id;
         status.source_type = s->source_type;
         status.encoder_name = s->encoder ? s->encoder->getName() : "None";
+        
+        // 判斷協定狀態
+        if (s->srt_server && s->srt_server->hasClient()) {
+            status.protocol = "SRT";
+        } else if (s->streaming.load()) {
+            status.protocol = "gRPC";
+        } else {
+            status.protocol = "-";
+        }
+        
         status.streaming = s->streaming.load();
         status.stream_id = s->stream_id;  // FlowMeter 會用這個 ID 查詢實際速率
         status.width = s->width;
