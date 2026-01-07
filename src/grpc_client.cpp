@@ -41,21 +41,51 @@ static void convert_property(const obsremote::Property& src, GrpcClient::Propert
     dst.description = src.description();
     dst.type = src.type();
     dst.visible = src.visible();
+    dst.enabled = src.enabled();
+    dst.long_description = src.long_description();
+    
+    // LIST
     dst.current_string = src.current_string();
-    dst.default_bool = src.default_bool();
-    dst.min_int = src.min_int();
-    dst.max_int = src.max_int();
-    dst.step_int = src.step_int();
-    dst.default_int = src.default_int();
-    dst.min_float = src.min_float();
-    dst.max_float = src.max_float();
-    dst.step_float = src.step_float();
-    dst.default_float = src.default_float();
+    dst.current_int = src.current_int();
+    dst.current_float = src.current_float();
+    dst.list_format = src.list_format();
     
     dst.items.clear();
     for (const auto& item : src.items()) {
-        dst.items.push_back({item.name(), item.value()});
+        GrpcClient::PropertyItem pi;
+        pi.name = item.name();
+        pi.value_string = item.value_string();
+        pi.value_int = item.value_int();
+        pi.value_float = item.value_float();
+        dst.items.push_back(std::move(pi));
     }
+    
+    // Bool
+    dst.current_bool = src.current_bool();
+    
+    // Int
+    dst.min_int = src.min_int();
+    dst.max_int = src.max_int();
+    dst.step_int = src.step_int();  
+    dst.current_int_value = src.current_int_value();
+    dst.int_type = src.int_type();
+    
+    // Float
+    dst.min_float = src.min_float();
+    dst.max_float = src.max_float();
+    dst.step_float = src.step_float();
+    dst.current_float_value = src.current_float_value();
+    dst.float_type = src.float_type();
+    
+    // Text
+    dst.current_text = src.current_text();
+    dst.text_type = src.text_type();
+    dst.text_info_type = src.text_info_type();
+    
+    // Path
+    dst.path_type = src.path_type();
+    dst.path_filter = src.path_filter();
+    dst.path_default = src.path_default();
 }
 
 static void convert_properties(const google::protobuf::RepeatedPtrField<obsremote::Property>& src,

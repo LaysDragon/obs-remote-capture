@@ -7,7 +7,7 @@ enum VideoCodec {
   CODEC_H264 = 2;      // H.264/NVENC
 }
 
-// 屬性類型
+// 屬性類型 (與 OBS obs_property_type 對應，只列出實際支援的類型)
 enum PropertyType {
   PROPERTY_UNKNOWN = 0;
   PROPERTY_BOOL = 1;
@@ -16,12 +16,52 @@ enum PropertyType {
   PROPERTY_TEXT = 4;
   PROPERTY_PATH = 5;
   PROPERTY_LIST = 6;
+  PROPERTY_COLOR = 7;
+  PROPERTY_BUTTON = 8;        // 不支援傳輸，但保留可識別
+  PROPERTY_COLOR_ALPHA = 13;  // OBS 原生值
+}
+
+// 數字類型 (slider vs spinbox)
+enum NumberType {
+  NUMBER_SCROLLER = 0;
+  NUMBER_SLIDER = 1;
+}
+
+// 文字類型 (obs_text_type)
+enum TextType {
+  TEXT_DEFAULT = 0;
+  TEXT_PASSWORD = 1;
+  TEXT_MULTILINE = 2;
+  TEXT_INFO = 3;
+}
+
+// 文字資訊類型 (obs_text_info_type)
+enum TextInfoType {
+  TEXT_INFO_NORMAL = 0;
+  TEXT_INFO_WARNING = 1;
+  TEXT_INFO_ERROR = 2;
+}
+
+// 路徑類型
+enum PathType {
+  PATH_FILE = 0;
+  PATH_FILE_SAVE = 1;
+  PATH_DIRECTORY = 2;
+}
+
+// 列表格式
+enum ListFormat {
+  LIST_FORMAT_STRING = 0;
+  LIST_FORMAT_INT = 1;
+  LIST_FORMAT_FLOAT = 2;
 }
 
 // 列表項
 message ListItem {
   string name = 1;
-  string value = 2;
+  string value_string = 2;
+  int64 value_int = 3;
+  double value_float = 4;
 }
 
 // 屬性定義
@@ -30,29 +70,42 @@ message Property {
   string description = 2;
   PropertyType type = 3;
   bool visible = 4;
+  bool enabled = 5;
+  string long_description = 6;
   
   // LIST 類型
   repeated ListItem items = 10;
   string current_string = 11;
   int64 current_int = 12;
+  double current_float = 13;
+  ListFormat list_format = 14;
   
   // BOOL 類型
-  bool default_bool = 20;
+  bool current_bool = 20;
   
   // INT 類型
   int32 min_int = 30;
   int32 max_int = 31;
   int32 step_int = 32;
-  int32 default_int = 33;
+  int32 current_int_value = 33;
+  NumberType int_type = 34;
   
   // FLOAT 類型
   double min_float = 40;
   double max_float = 41;
   double step_float = 42;
-  double default_float = 43;
+  double current_float_value = 43;
+  NumberType float_type = 44;
   
   // TEXT 類型
-  string default_text = 50;
+  string current_text = 50;
+  TextType text_type = 51;
+  TextInfoType text_info_type = 52;
+  
+  // PATH 類型
+  PathType path_type = 60;
+  string path_filter = 61;
+  string path_default = 62;
 }
 
 // ========== Session-based API ==========

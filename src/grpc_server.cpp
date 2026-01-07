@@ -143,66 +143,107 @@ static void fill_properties_from_source(obs_source_t* source,
     if (!source) return;
     
     obs_properties_t* props = obs_source_properties(source);
-    obs_data_t* defaults = obs_source_get_settings(source);
+    obs_data_t* settings = obs_source_get_settings(source);
     
     if (props) {
         obs_property_t* p = obs_properties_first(props);
         while (p) {
-            if (!obs_property_visible(p)) {
-                obs_property_next(&p);
-                continue;
-            }
-            
             Property* proto_prop = out_props->Add();
-            proto_prop->set_name(obs_property_name(p));
+            const char* name = obs_property_name(p);
             const char* desc = obs_property_description(p);
+            obs_property_type type = obs_property_get_type(p);
+            
+            proto_prop->set_name(name ? name : "");
             proto_prop->set_description(desc ? desc : "");
-            proto_prop->set_type(static_cast<PropertyType>(obs_property_get_type(p)));
-            proto_prop->set_visible(true);
+            proto_prop->set_type(static_cast<PropertyType>(type));
+            proto_prop->set_visible(obs_property_visible(p));
+            proto_prop->set_enabled(obs_property_enabled(p));
+            
+            const char* long_desc = obs_property_long_description(p);
+            if (long_desc) proto_prop->set_long_description(long_desc);
             
             // 處理 LIST 類型
-            if (obs_property_get_type(p) == OBS_PROPERTY_LIST) {
+            if (type == OBS_PROPERTY_LIST) {
+                obs_combo_format format = obs_property_list_format(p);
+                proto_prop->set_list_format(static_cast<ListFormat>(format));
+                
                 size_t count = obs_property_list_item_count(p);
                 for (size_t i = 0; i < count; i++) {
                     ListItem* item = proto_prop->add_items();
                     const char* item_name = obs_property_list_item_name(p, i);
                     item->set_name(item_name ? item_name : "");
                     
-                    if (obs_property_list_format(p) == OBS_COMBO_FORMAT_STRING) {
+                    if (format == OBS_COMBO_FORMAT_INT) {
+                        item->set_value_int(obs_property_list_item_int(p, i));
+                    } else if (format == OBS_COMBO_FORMAT_FLOAT) {
+                        item->set_value_float(obs_property_list_item_float(p, i));
+                    } else {
                         const char* item_val = obs_property_list_item_string(p, i);
-                        item->set_value(item_val ? item_val : "");
+                        item->set_value_string(item_val ? item_val : "");
                     }
                 }
                 
-                const char* name = obs_property_name(p);
-                if (name && obs_property_list_format(p) == OBS_COMBO_FORMAT_STRING) {
-                    const char* current_val = obs_data_get_string(defaults, name);
-                    proto_prop->set_current_string(current_val ? current_val : "");
+                // 當前值
+                if (name) {
+                    if (format == OBS_COMBO_FORMAT_INT) {
+                        proto_prop->set_current_int(obs_data_get_int(settings, name));
+                    } else if (format == OBS_COMBO_FORMAT_FLOAT) {
+                        proto_prop->set_current_float(obs_data_get_double(settings, name));
+                    } else {
+                        const char* val = obs_data_get_string(settings, name);
+                        proto_prop->set_current_string(val ? val : "");
+                    }
                 }
             }
-            
             // 處理 BOOL 類型
-            if (obs_property_get_type(p) == OBS_PROPERTY_BOOL) {
-                const char* name = obs_property_name(p);
-                proto_prop->set_default_bool(obs_data_get_bool(defaults, name));
+            else if (type == OBS_PROPERTY_BOOL) {
+                if (name) {
+                    proto_prop->set_current_bool(obs_data_get_bool(settings, name));
+                }
             }
-            
             // 處理 INT 類型
-            if (obs_property_get_type(p) == OBS_PROPERTY_INT) {
+            else if (type == OBS_PROPERTY_INT) {
                 proto_prop->set_min_int((int32_t)obs_property_int_min(p));
                 proto_prop->set_max_int((int32_t)obs_property_int_max(p));
                 proto_prop->set_step_int((int32_t)obs_property_int_step(p));
-                proto_prop->set_default_int(
-                    (int32_t)obs_data_get_int(defaults, obs_property_name(p)));
+                proto_prop->set_int_type(static_cast<NumberType>(obs_property_int_type(p)));
+                if (name) {
+                    proto_prop->set_current_int_value((int32_t)obs_data_get_int(settings, name));
+                }
             }
-            
             // 處理 FLOAT 類型
-            if (obs_property_get_type(p) == OBS_PROPERTY_FLOAT) {
+            else if (type == OBS_PROPERTY_FLOAT) {
                 proto_prop->set_min_float(obs_property_float_min(p));
                 proto_prop->set_max_float(obs_property_float_max(p));
                 proto_prop->set_step_float(obs_property_float_step(p));
-                proto_prop->set_default_float(
-                    obs_data_get_double(defaults, obs_property_name(p)));
+                proto_prop->set_float_type(static_cast<NumberType>(obs_property_float_type(p)));
+                if (name) {
+                    proto_prop->set_current_float_value(obs_data_get_double(settings, name));
+                }
+            }
+            // 處理 TEXT 類型
+            else if (type == OBS_PROPERTY_TEXT) {
+                proto_prop->set_text_type(static_cast<TextType>(obs_property_text_type(p)));
+                proto_prop->set_text_info_type(static_cast<TextInfoType>(obs_property_text_info_type(p)));
+                if (name) {
+                    const char* val = obs_data_get_string(settings, name);
+                    proto_prop->set_current_text(val ? val : "");
+                }
+            }
+            // 處理 PATH 類型
+            else if (type == OBS_PROPERTY_PATH) {
+                proto_prop->set_path_type(static_cast<PathType>(obs_property_path_type(p)));
+                const char* filter = obs_property_path_filter(p);
+                const char* default_path = obs_property_path_default_path(p);
+                if (filter) proto_prop->set_path_filter(filter);
+                if (default_path) proto_prop->set_path_default(default_path);
+            }
+            // COLOR / COLOR_ALPHA - 只需要傳遞類型，當前值通過 settings 讀取
+            else if (type == OBS_PROPERTY_COLOR || type == OBS_PROPERTY_COLOR_ALPHA) {
+                // 當前值作為 INT 傳遞
+                if (name) {
+                    proto_prop->set_current_int_value((int32_t)obs_data_get_int(settings, name));
+                }
             }
             
             obs_property_next(&p);
@@ -210,7 +251,7 @@ static void fill_properties_from_source(obs_source_t* source,
         obs_properties_destroy(props);
     }
     
-    obs_data_release(defaults);
+    obs_data_release(settings);
 }
 
 // ========== 音頻捕獲回調 ==========

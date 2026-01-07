@@ -826,35 +826,92 @@ static void remove_child_properties(obs_properties_t* props) {
 static void add_child_properties_from_cache(obs_properties_t* props, 
                                             const std::vector<GrpcClient::Property>& cached_props) {
     for (const auto& cprop : cached_props) {
+        // 跳過不可見的屬性
+        if (!cprop.visible) continue;
+        
         std::string child_name = "child_" + cprop.name;
+        obs_property_t* new_prop = nullptr;
         
         switch (cprop.type) {
         case OBS_PROPERTY_LIST: {
-            obs_property_t* list = obs_properties_add_list(props,
+            // 根據 list_format 選擇正確的格式
+            obs_combo_format format = (obs_combo_format)cprop.list_format;
+            new_prop = obs_properties_add_list(props,
                 child_name.c_str(), cprop.description.c_str(),
-                OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+                OBS_COMBO_TYPE_LIST, format);
+            
             for (const auto& item : cprop.items) {
-                obs_property_list_add_string(list, item.name.c_str(), item.value.c_str());
+                if (format == OBS_COMBO_FORMAT_INT) {
+                    obs_property_list_add_int(new_prop, item.name.c_str(), item.value_int);
+                } else if (format == OBS_COMBO_FORMAT_FLOAT) {
+                    obs_property_list_add_float(new_prop, item.name.c_str(), item.value_float);
+                } else {
+                    obs_property_list_add_string(new_prop, item.name.c_str(), item.value_string.c_str());
+                }
             }
             break;
         }
         case OBS_PROPERTY_BOOL:
-            obs_properties_add_bool(props, child_name.c_str(), cprop.description.c_str());
+            new_prop = obs_properties_add_bool(props, child_name.c_str(), cprop.description.c_str());
             break;
-        case OBS_PROPERTY_INT:
-            obs_properties_add_int(props, child_name.c_str(), cprop.description.c_str(),
-                cprop.min_int, cprop.max_int, cprop.step_int);
+            
+        case OBS_PROPERTY_INT: {
+            // 根據 int_type 選擇 slider 或 spinbox
+            if (cprop.int_type == 1) {  // OBS_NUMBER_SLIDER
+                new_prop = obs_properties_add_int_slider(props, child_name.c_str(), 
+                    cprop.description.c_str(), cprop.min_int, cprop.max_int, cprop.step_int);
+            } else {
+                new_prop = obs_properties_add_int(props, child_name.c_str(), 
+                    cprop.description.c_str(), cprop.min_int, cprop.max_int, cprop.step_int);
+            }
             break;
-        case OBS_PROPERTY_FLOAT:
-            obs_properties_add_float(props, child_name.c_str(), cprop.description.c_str(),
-                cprop.min_float, cprop.max_float, cprop.step_float);
+        }
+        case OBS_PROPERTY_FLOAT: {
+            // 根據 float_type 選擇 slider 或 spinbox
+            if (cprop.float_type == 1) {  // OBS_NUMBER_SLIDER
+                new_prop = obs_properties_add_float_slider(props, child_name.c_str(), 
+                    cprop.description.c_str(), cprop.min_float, cprop.max_float, cprop.step_float);
+            } else {
+                new_prop = obs_properties_add_float(props, child_name.c_str(), 
+                    cprop.description.c_str(), cprop.min_float, cprop.max_float, cprop.step_float);
+            }
             break;
-        case OBS_PROPERTY_TEXT:
-            obs_properties_add_text(props, child_name.c_str(), cprop.description.c_str(),
-                OBS_TEXT_DEFAULT);
+        }
+        case OBS_PROPERTY_TEXT: {
+            obs_text_type text_type = (obs_text_type)cprop.text_type;
+            new_prop = obs_properties_add_text(props, child_name.c_str(), 
+                cprop.description.c_str(), text_type);
+            obs_property_text_set_info_type(new_prop, (obs_text_info_type)cprop.text_info_type);
             break;
+        }
+        case OBS_PROPERTY_PATH: {
+            obs_path_type path_type = (obs_path_type)cprop.path_type;
+            new_prop = obs_properties_add_path(props, child_name.c_str(), 
+                cprop.description.c_str(), path_type, 
+                cprop.path_filter.c_str(), cprop.path_default.c_str());
+            break;
+        }
+        case OBS_PROPERTY_COLOR:
+            new_prop = obs_properties_add_color(props, child_name.c_str(), cprop.description.c_str());
+            break;
+            
+        case OBS_PROPERTY_COLOR_ALPHA:
+            new_prop = obs_properties_add_color_alpha(props, child_name.c_str(), cprop.description.c_str());
+            break;
+            
         default:
+            // 跳過不支援的類型 (BUTTON, FONT, etc.)
+            blog(LOG_DEBUG, "[Remote Source] Skipping unsupported property type %d: %s", 
+                 cprop.type, cprop.name.c_str());
             break;
+        }
+        
+        // 設定 enabled 狀態和 long_description
+        if (new_prop) {
+            obs_property_set_enabled(new_prop, cprop.enabled);
+            if (!cprop.long_description.empty()) {
+                obs_property_set_long_description(new_prop, cprop.long_description.c_str());
+            }
         }
     }
 }

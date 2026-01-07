@@ -45,29 +45,52 @@ public:
         std::string display_name;
     };
     
-    // 屬性項目
+    // 屬性項目 (列表選項)
     struct PropertyItem {
         std::string name;
-        std::string value;
+        std::string value_string;
+        int64_t value_int = 0;
+        double value_float = 0.0;
     };
     
     // 屬性結構
     struct Property {
         std::string name;
         std::string description;
-        int type;
-        bool visible;
+        int type = 0;
+        bool visible = true;
+        bool enabled = true;
+        std::string long_description;
+        
+        // LIST
         std::vector<PropertyItem> items;
         std::string current_string;
+        int64_t current_int = 0;
+        double current_float = 0.0;
+        int list_format = 0;  // 0=string, 1=int, 2=float
         
         // Bool
-        bool default_bool;
+        bool current_bool = false;
         
         // Int
-        int min_int, max_int, step_int, default_int;
+        int min_int = 0, max_int = 0, step_int = 1;
+        int current_int_value = 0;
+        int int_type = 0;  // 0=scroller, 1=slider
         
         // Float
-        double min_float, max_float, step_float, default_float;
+        double min_float = 0, max_float = 0, step_float = 0.01;
+        double current_float_value = 0;
+        int float_type = 0;  // 0=scroller, 1=slider
+        
+        // Text
+        std::string current_text;
+        int text_type = 0;       // 0=default, 1=password, 2=multiline, 3=info
+        int text_info_type = 0;  // 0=normal, 1=warning, 2=error
+        
+        // Path
+        int path_type = 0;  // 0=file, 1=file_save, 2=directory
+        std::string path_filter;
+        std::string path_default;
     };
 
     // 構造/析構
