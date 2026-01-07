@@ -40,6 +40,7 @@ using namespace obsremote;
 #include <sstream>
 #include <map>
 #include <chrono>
+#include <cmath>  // for sqrt()
 
 // H.264 解碼器
 #include "codec_ffmpeg.h"
@@ -214,7 +215,15 @@ static struct {
     int64_t total_decode_ms = 0;
     int64_t total_recv_to_ready_ms = 0;
     int64_t total_e2e_ms = 0;
+    int64_t total_e2e_sq_ms = 0;       // E2E 平方和 (用於計算變異數)
     uint32_t perf_frame_count = 0;
+    
+    // 自適應 jitter buffer 參數 (持久化，不每 30 幀重置)
+    double running_avg_e2e_ms = 100.0;   // EMA 平均 E2E
+    double running_var_e2e_ms = 0.0;     // EMA 變異數
+    int64_t jitter_buffer_ns = 150 * 1000000;  // 初始 150ms
+    static constexpr double EMA_ALPHA = 0.1;   // EMA 平滑係數
+    static constexpr int64_t MARGIN_MS = 50;   // 固定安全邊際
 } client_perf;
 
 static void grpc_video_callback(uint32_t width, uint32_t height,
@@ -288,6 +297,7 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
         client_perf.total_decode_ms += decode_ms;
         client_perf.total_recv_to_ready_ms += recv_to_ready_ms;
         client_perf.total_e2e_ms += e2e_ms;
+        client_perf.total_e2e_sq_ms += e2e_ms * e2e_ms;  // 平方和
         if (recv_interval_ms > client_perf.max_recv_interval_ms) 
             client_perf.max_recv_interval_ms = recv_interval_ms;
         if (decode_ms > client_perf.max_decode_ms) 
@@ -296,6 +306,17 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
             client_perf.max_recv_to_ready_ms = recv_to_ready_ms;
         if (e2e_ms > client_perf.max_e2e_ms) 
             client_perf.max_e2e_ms = e2e_ms;
+        
+        // 更新 EMA 平均和變異數 (每幀更新)
+        double delta = (double)e2e_ms - client_perf.running_avg_e2e_ms;
+        client_perf.running_avg_e2e_ms += client_perf.EMA_ALPHA * delta;
+        client_perf.running_var_e2e_ms = (1.0 - client_perf.EMA_ALPHA) * 
+            (client_perf.running_var_e2e_ms + client_perf.EMA_ALPHA * delta * delta);
+        
+        // 計算自適應 jitter buffer: avg + 2*stddev + margin
+        double stddev_ms = sqrt(client_perf.running_var_e2e_ms);
+        double buffer_ms = client_perf.running_avg_e2e_ms + 2.0 * stddev_ms + client_perf.MARGIN_MS;
+        client_perf.jitter_buffer_ns = (int64_t)(buffer_ms * 1000000.0);
         
         // 每 30 幀輸出統計
         if (client_perf.perf_frame_count % 30 == 0) {
@@ -308,11 +329,14 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
                  avg_decode, client_perf.max_decode_ms,
                  avg_ready, client_perf.max_recv_to_ready_ms,
                  avg_e2e, client_perf.max_e2e_ms);
-            // 重置統計
+            blog(LOG_INFO, "[Jitter Buffer] ema_avg=%.1fms, stddev=%.1fms, buffer=%.1fms",
+                 client_perf.running_avg_e2e_ms, stddev_ms, buffer_ms);
+            // 重置 30 幀統計 (但保留 EMA 和 jitter_buffer_ns)
             client_perf.total_recv_interval_ms = 0;
             client_perf.total_decode_ms = 0;
             client_perf.total_recv_to_ready_ms = 0;
             client_perf.total_e2e_ms = 0;
+            client_perf.total_e2e_sq_ms = 0;
             client_perf.max_recv_interval_ms = 0;
             client_perf.max_decode_ms = 0;
             client_perf.max_recv_to_ready_ms = 0;
@@ -324,12 +348,13 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
         data->video_height.store(decoded_height);
         
         // 使用 OBS async video API 輸出視訊幀
-        // 這會讓 OBS 自動根據 timestamp 同步視訊和音訊
+        // 應用自適應 jitter buffer: timestamp + buffer_delay 讓幀「在未來」
+        // OBS 會等待正確時間再顯示，音視訊保持同步
         struct obs_source_frame frame = {};
         frame.width = decoded_width;
         frame.height = decoded_height;
         frame.format = VIDEO_FORMAT_BGRA;  // FFmpeg decoder 輸出 BGRA
-        frame.timestamp = timestamp_ns;
+        frame.timestamp = timestamp_ns + client_perf.jitter_buffer_ns;
         frame.data[0] = decoded.data();
         frame.linesize[0] = decoded_width * 4;  // BGRA = 4 bytes per pixel
         frame.full_range = true;
@@ -355,7 +380,8 @@ static void grpc_audio_callback(uint32_t sample_rate, uint32_t channels,
     audio.speakers = (channels == 2) ? SPEAKERS_STEREO : SPEAKERS_MONO;
     audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
     audio.samples_per_sec = sample_rate;
-    audio.timestamp = timestamp_ns;
+    // 應用相同的 jitter buffer offset，保持 A/V 同步
+    audio.timestamp = timestamp_ns + client_perf.jitter_buffer_ns;
     
     obs_source_output_audio(data->source, &audio);
 }
@@ -454,7 +480,7 @@ static void start_streaming(remote_source_data* data) {
     
     // 先獲取 SRT 資訊（知道 port）
     int srt_port = 0;
-    int srt_latency_ms = 200;
+    int srt_latency_ms = 100;
     bool want_srt = data->use_srt && data->grpc_client;
     
     if (want_srt) {
