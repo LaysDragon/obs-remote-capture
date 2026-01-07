@@ -857,8 +857,17 @@ public:
                 }
             }
             
-            // 約 30 FPS
-            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+            // 動態 FPS 計時: 扣除處理時間後計算剩餘等待時間，穩定 30fps
+            constexpr int TARGET_FPS = 30;
+            constexpr auto frame_interval = std::chrono::milliseconds(1000 / TARGET_FPS);  // 33ms
+            auto elapsed = std::chrono::steady_clock::now() - t_start;
+            auto sleep_time = frame_interval - std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+            if (sleep_time.count() > 0) {
+                std::this_thread::sleep_for(sleep_time);
+            }else{
+                //spent tooo much time in this loop,the frame is delayed
+                blog(LOG_WARNING, "[gRPC Server] Stream %s frame delayed %dms", session_id.c_str(), sleep_time.count());
+            }
         }
         
         // 清理
