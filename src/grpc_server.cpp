@@ -100,7 +100,7 @@ struct Session {
     // SRT 傳輸
     std::unique_ptr<SrtServer> srt_server;
     int srt_port = 0;
-    int srt_latency_ms = 20;  // SRT 延遲設定 (本機測試用低延遲値)
+    int srt_latency_ms = 200;  // SRT 延遲設定 (本機測試用低延遲値)
     bool use_srt = true;  // 是否使用 SRT (vs gRPC fallback)
 };
 
