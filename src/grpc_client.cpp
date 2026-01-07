@@ -281,10 +281,95 @@ public:
         return true;
     }
     
+    // 時鐘同步 (RTT 測量)
+    bool SyncClock(GrpcClient::ClockSyncResult& out_result, int rounds) {
+        std::vector<int64_t> rtts;
+        std::vector<int64_t> offsets;
+        
+        for (int i = 0; i < rounds; i++) {
+            SyncClockRequest request;
+            request.set_client_send_time_ns(os_gettime_ns());
+            
+            int64_t send_time = os_gettime_ns();
+            
+            SyncClockResponse response;
+            ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+            
+            Status status = stub_->SyncClock(&context, request, &response);
+            
+            int64_t recv_time = os_gettime_ns();
+            
+            if (!status.ok()) {
+                blog(LOG_WARNING, "[gRPC Client] SyncClock round %d failed: %s", 
+                     i, status.error_message().c_str());
+                continue;
+            }
+            
+            int64_t rtt = recv_time - send_time;
+            // offset = (client_mid_time) - server_time
+            // client_mid_time = send_time + rtt/2
+            int64_t client_mid = send_time + rtt / 2;
+            int64_t offset = client_mid - response.server_time_ns();
+            
+            rtts.push_back(rtt);
+            offsets.push_back(offset);
+        }
+        
+        if (rtts.size() < 3) {
+            blog(LOG_WARNING, "[gRPC Client] SyncClock: not enough successful rounds (%zu/%d)",
+                 rtts.size(), rounds);
+            out_result.valid = false;
+            return false;
+        }
+        
+        // 排除最大和最小 RTT 的異常值
+        size_t min_idx = 0, max_idx = 0;
+        for (size_t i = 1; i < rtts.size(); i++) {
+            if (rtts[i] < rtts[min_idx]) min_idx = i;
+            if (rtts[i] > rtts[max_idx]) max_idx = i;
+        }
+        
+        int64_t sum_rtt = 0, sum_offset = 0;
+        int count = 0;
+        for (size_t i = 0; i < rtts.size(); i++) {
+            if (i != min_idx && i != max_idx) {
+                sum_rtt += rtts[i];
+                sum_offset += offsets[i];
+                count++;
+            }
+        }
+        
+        if (count == 0) {
+            // 如果只有 2 個樣本，直接平均
+            for (size_t i = 0; i < rtts.size(); i++) {
+                sum_rtt += rtts[i];
+                sum_offset += offsets[i];
+            }
+            count = (int)rtts.size();
+        }
+        
+        out_result.rtt_ns = sum_rtt / count;
+        out_result.clock_offset_ns = sum_offset / count;
+        out_result.valid = true;
+        
+        blog(LOG_INFO, "[gRPC Client] SyncClock: offset=%lld ns (%.2f ms), avg_rtt=%.2f ms",
+             (long long)out_result.clock_offset_ns, 
+             out_result.clock_offset_ns / 1000000.0,
+             out_result.rtt_ns / 1000000.0);
+        
+        // 存儲 offset 供後續 timestamp 轉換使用
+        clock_offset_ns_ = out_result.clock_offset_ns;
+        clock_sync_valid_ = true;
+        
+        return true;
+    }
+    
     // 開始接收串流
     bool StartStream(const std::string& session_id,
                      GrpcClient::VideoCallback on_video,
-                     GrpcClient::AudioCallback on_audio) {
+                     GrpcClient::AudioCallback on_audio,
+                     GrpcClient::StreamInfoCallback on_stream_info) {
         if (streaming_.load()) {
             StopStream();
         }
@@ -292,6 +377,7 @@ public:
         streaming_.store(true);
         on_video_ = on_video;
         on_audio_ = on_audio;
+        on_stream_info_ = on_stream_info;
         
         stream_thread_ = std::thread([this, session_id]() {
             StartStreamRequest request;
@@ -308,7 +394,19 @@ public:
             uint32_t audio_frame_count = 0;
             
             while (streaming_.load() && reader->Read(&frame)) {
-                if (frame.has_video()) {
+                if (frame.has_stream_info()) {
+                    // 收到 StreamInfo - 僅在串流開始時發送一次
+                    const StreamInfo& info = frame.stream_info();
+                    stream_start_time_ns_ = info.stream_start_time_ns();
+                    stream_info_received_ = true;
+                    blog(LOG_INFO, "[gRPC Client] Received StreamInfo: stream_start_time_ns=%lld",
+                         (long long)stream_start_time_ns_.load());
+                    
+                    // 回調通知外部
+                    if (on_stream_info_) {
+                        on_stream_info_(stream_start_time_ns_.load());
+                    }
+                } else if (frame.has_video()) {
                     const VideoFrame& v = frame.video();
                     video_frame_count++;
                     
@@ -319,12 +417,22 @@ public:
                     }
                     
                     if (on_video_) {
+                        // 將 server 時間戳轉換為 client 時間參考
+                        // 1. 還原 server 捕獲時間: server_capture_time = stream_start_time + relative_pts
+                        // 2. 轉換到 client 時間: client_capture_time = server_capture_time + clock_offset
+                        uint64_t client_timestamp_ns = v.timestamp_ns();
+                        if (stream_info_received_.load() && clock_sync_valid_.load()) {
+                            int64_t relative_pts_ns = (int64_t)v.timestamp_ns();
+                            int64_t server_capture_time_ns = stream_start_time_ns_.load() + relative_pts_ns;
+                            client_timestamp_ns = (uint64_t)(server_capture_time_ns + clock_offset_ns_.load());
+                        }
+                        
                         on_video_(v.width(), v.height(),
                                   static_cast<int>(v.codec()),
                                   reinterpret_cast<const uint8_t*>(v.frame_data().data()),
                                   v.frame_data().size(),
                                   v.linesize(),
-                                  v.timestamp_ns());
+                                  client_timestamp_ns);
                     }
                 } else if (frame.has_audio()) {
                     const AudioFrame& a = frame.audio();
@@ -334,10 +442,21 @@ public:
                         // frame_data 現在是 planar 格式 (L|L|L|...|R|R|R|...)
                         // 每個 channel 的樣本數 = 總大小 / sizeof(float) / 2
                         size_t samples_per_channel = a.frame_data().size() / sizeof(float) / 2;
+                        
+                        // 將 server 時間戳轉換為 client 時間參考
+                        // 1. 還原 server 捕獲時間: server_capture_time = stream_start_time + relative_pts
+                        // 2. 轉換到 client 時間: client_capture_time = server_capture_time + clock_offset
+                        uint64_t client_timestamp_ns = a.timestamp_ns();
+                        if (stream_info_received_.load() && clock_sync_valid_.load()) {
+                            int64_t relative_pts_ns = (int64_t)a.timestamp_ns();
+                            int64_t server_capture_time_ns = stream_start_time_ns_.load() + relative_pts_ns;
+                            client_timestamp_ns = (uint64_t)(server_capture_time_ns + clock_offset_ns_.load());
+                        }
+                        
                         on_audio_(a.sample_rate(), a.channels(),
                                   reinterpret_cast<const float*>(a.frame_data().data()),
                                   samples_per_channel,
-                                  a.timestamp_ns());
+                                  client_timestamp_ns);
                     }
                 }
             }
@@ -383,6 +502,19 @@ private:
     std::unique_ptr<ClientContext> stream_context_;
     GrpcClient::VideoCallback on_video_;
     GrpcClient::AudioCallback on_audio_;
+    GrpcClient::StreamInfoCallback on_stream_info_;
+    
+    // 時鐘同步資訊
+    std::atomic<int64_t> clock_offset_ns_{0};  // client_time - server_time
+    std::atomic<bool> clock_sync_valid_{false};
+    
+    // 串流開始時間 (Server 端的 os_gettime_ns)
+    std::atomic<int64_t> stream_start_time_ns_{0};
+    std::atomic<bool> stream_info_received_{false};
+    
+public:
+    int64_t GetClockOffset() const { return clock_offset_ns_.load(); }
+    int64_t GetStreamStartTime() const { return stream_start_time_ns_.load(); }
 };
 
 // ========== GrpcClient 公開接口實現 ==========
@@ -438,10 +570,15 @@ bool GrpcClient::getSrtInfo(const std::string& session_id, SrtInfo& out_info) {
     return impl_->GetSrtInfo(session_id, out_info);
 }
 
+bool GrpcClient::syncClock(ClockSyncResult& out_result, int rounds) {
+    return impl_->SyncClock(out_result, rounds);
+}
+
 bool GrpcClient::startStream(const std::string& session_id,
                               VideoCallback on_video,
-                              AudioCallback on_audio) {
-    return impl_->StartStream(session_id, on_video, on_audio);
+                              AudioCallback on_audio,
+                              StreamInfoCallback on_stream_info) {
+    return impl_->StartStream(session_id, on_video, on_audio, on_stream_info);
 }
 
 void GrpcClient::stopStream() {
@@ -450,4 +587,12 @@ void GrpcClient::stopStream() {
 
 bool GrpcClient::isStreaming() const {
     return impl_->IsStreaming();
+}
+
+int64_t GrpcClient::getClockOffset() const {
+    return impl_->GetClockOffset();
+}
+
+int64_t GrpcClient::getStreamStartTime() const {
+    return impl_->GetStreamStartTime();
 }

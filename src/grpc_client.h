@@ -37,6 +37,7 @@ public:
     using AudioCallback = std::function<void(uint32_t sample_rate, uint32_t channels,
                                               const float* pcm_data, size_t samples,
                                               uint64_t timestamp_ns)>;
+    using StreamInfoCallback = std::function<void(int64_t stream_start_time_ns)>;
 
     // Source 資訊
     struct SourceInfo {
@@ -116,12 +117,27 @@ public:
     // 獲取 SRT 串流資訊
     bool getSrtInfo(const std::string& session_id, SrtInfo& out_info);
     
+    // 時鐘同步結果
+    struct ClockSyncResult {
+        int64_t clock_offset_ns = 0;  // Client 時間 - Server 時間 估算值
+        int64_t rtt_ns = 0;           // 平均 RTT (納秒)
+        bool valid = false;
+    };
+    
+    // 時鐘同步 (執行多輪 RTT 測量，排除異常值)
+    bool syncClock(ClockSyncResult& out_result, int rounds = 5);
+    
     // 串流控制 (綁定 session_id)
     bool startStream(const std::string& session_id,
                      VideoCallback on_video,
-                     AudioCallback on_audio);
+                     AudioCallback on_audio,
+                     StreamInfoCallback on_stream_info = nullptr);
     void stopStream();
     bool isStreaming() const;
+    
+    // 獲取時鐘同步資訊 (供外部使用)
+    int64_t getClockOffset() const;
+    int64_t getStreamStartTime() const;
 
 private:
     class Impl;

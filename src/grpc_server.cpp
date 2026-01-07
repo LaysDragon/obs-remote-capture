@@ -94,12 +94,13 @@ struct Session {
     // 流量計 ID
     uint64_t stream_id{0};
     
-    // 串流開始時間 (用於計算相對時間戳)
-    std::chrono::steady_clock::time_point stream_start_time{};
+    // 串流開始時間 (用於計算相對時間戳，使用 os_gettime_ns 以便與 clock sync 配合)
+    int64_t stream_start_time_ns{0};
     
     // SRT 傳輸
     std::unique_ptr<SrtServer> srt_server;
     int srt_port = 0;
+    int srt_latency_ms = 20;  // SRT 延遲設定 (本機測試用低延遲値)
     bool use_srt = true;  // 是否使用 SRT (vs gRPC fallback)
 };
 
@@ -108,6 +109,7 @@ static std::map<std::string, std::unique_ptr<Session>> g_sessions;
 static std::mutex g_sessions_mutex;
 
 // ========== 白名單：可用 source 類型 ==========
+//TODO: 只要記錄ID即可，名稱即時提取
 static const struct {
     const char* id;
     const char* display_name;
@@ -225,9 +227,7 @@ static void grpc_audio_callback(void* param, obs_source_t* source,
     frame.set_sample_rate(48000);
     frame.set_channels(2);
     // 使用相對時間戳 (從 stream 開始的偏移量，納秒)
-    auto now = std::chrono::steady_clock::now();
-    int64_t relative_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now - session->stream_start_time).count();
+    int64_t relative_ns = os_gettime_ns() - session->stream_start_time_ns;
     frame.set_timestamp_ns(relative_ns);
     
     // 計算每個 plane 的數據大小
@@ -334,9 +334,7 @@ static bool capture_video_frame(Session* session, VideoFrame* out_frame) {
         obs_source_video_render(session->capture_source);
         gs_texrender_end(session->texrender);
         // 使用相對時間戳 (從 stream 開始的偏移量，納秒)
-        auto now = std::chrono::steady_clock::now();
-        int64_t relative_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now - session->stream_start_time).count();
+        int64_t relative_ns = os_gettime_ns() - session->stream_start_time_ns;
         out_frame->set_timestamp_ns(relative_ns);
     }
     
@@ -693,12 +691,24 @@ public:
         Session* session = it->second.get();
         
         response->set_port(session->srt_port);
-        response->set_latency_ms(200);  // 預設 200ms
+        response->set_latency_ms(session->srt_latency_ms);
         response->set_passphrase("");   // 暫不使用加密
         response->set_ready(session->srt_server && session->srt_server->isRunning());
         
         blog(LOG_INFO, "[gRPC Server] GetSrtInfo: session=%s, port=%d, ready=%d",
              session_id.c_str(), session->srt_port, response->ready());
+        return Status::OK;
+    }
+    
+    // 時鐘同步 (RTT 測量)
+    Status SyncClock(ServerContext* context,
+                     const SyncClockRequest* request,
+                     SyncClockResponse* response) override {
+        UNUSED_PARAMETER(context);
+        UNUSED_PARAMETER(request);
+        
+        // 立即回應 Server 端的時間戳
+        response->set_server_time_ns(os_gettime_ns());
         return Status::OK;
     }
     
@@ -724,9 +734,23 @@ public:
         }
         
         session->streaming.store(true);
-        session->stream_start_time = std::chrono::steady_clock::now();  // 記錄串流開始時間
+        session->stream_start_time_ns = os_gettime_ns();  // 記錄串流開始時間 (使用 os_gettime_ns)
         session->writer = writer;
         session->stream_id = g_flow_meter.registerStream();
+        
+        // 發送 StreamInfo 作為第一個訊息
+        {
+            StreamFrame info_frame;
+            info_frame.mutable_stream_info()->set_stream_start_time_ns(session->stream_start_time_ns);
+            
+            std::lock_guard<std::mutex> lock(session->writer_mutex);
+            if (!writer->Write(info_frame)) {
+                blog(LOG_WARNING, "[gRPC Server] Failed to send StreamInfo");
+            } else {
+                blog(LOG_INFO, "[gRPC Server] Sent StreamInfo: stream_start_time_ns=%lld", 
+                     (long long)session->stream_start_time_ns);
+            }
+        }
         
         // 啟動 SRT Server (如果尚未啟動)
         bool use_srt = session->use_srt && session->srt_server;
@@ -735,7 +759,7 @@ public:
             uint32_t width = session->width > 0 ? session->width : 1920;
             uint32_t height = session->height > 0 ? session->height : 1080;
             
-            if (session->srt_server->start(session->srt_port, 200, width, height, 30)) {
+            if (session->srt_server->start(session->srt_port, session->srt_latency_ms, width, height, 30)) {
                 blog(LOG_INFO, "[gRPC Server] SRT Server started on port %d for session %s",
                      session->srt_port, session_id.c_str());
             } else {

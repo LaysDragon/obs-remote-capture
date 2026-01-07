@@ -101,6 +101,11 @@ struct remote_source_data {
     bool use_srt{true};  // 是否使用 SRT (vs gRPC fallback)
     int srt_port{0};
     int srt_latency_ms{200};
+    
+    // 時鐘同步資訊 (用於 E2E 延遲計算)
+    std::atomic<int64_t> clock_offset_ns{0};       // client_time - server_time
+    std::atomic<int64_t> stream_start_time_ns{0};  // Server 端的 stream start time
+    std::atomic<bool> clock_sync_valid{false};
 
     remote_source_data() :
         source(nullptr),
@@ -208,14 +213,11 @@ static void disconnect_and_release_session(remote_source_data* data) {
 // 客戶端性能測量變數 (static 保持跨幀狀態)
 static struct {
     std::chrono::steady_clock::time_point last_recv_time{};
-    // 串流開始時間 (第一幀收到時設定)
-    std::chrono::steady_clock::time_point stream_start{};
-    bool stream_started = false;
     
     int64_t max_recv_interval_ms = 0;
     int64_t max_decode_ms = 0;
     int64_t max_recv_to_ready_ms = 0;  // 從接收到解碼完成的本地延遲
-    int64_t max_e2e_ms = 0;            // E2E: 從重建的捕獲時間到解碼完成
+    int64_t max_e2e_ms = 0;            // E2E: 從 Server 捕獲到 Client 解碼完成
     int64_t total_recv_interval_ms = 0;
     int64_t total_decode_ms = 0;
     int64_t total_recv_to_ready_ms = 0;
@@ -233,13 +235,6 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
     if (!data) return;
     
     auto recv_time = std::chrono::steady_clock::now();
-    
-    // 記錄串流開始時間 (第一幀)
-    // stream_start = 第一幀到達時間 - 第一幀的 PTS = 虛擬的串流起點
-    if (!client_perf.stream_started && timestamp_ns > 0) {
-        client_perf.stream_start = recv_time - std::chrono::nanoseconds(timestamp_ns);
-        client_perf.stream_started = true;
-    }
     
     static uint32_t callback_count = 0;
     callback_count++;
@@ -287,20 +282,12 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
             decode_end - recv_time).count();
         
         // E2E 延遲計算
-        // 重建捕獲時間 = stream_start + pts (pts 是 server 端的相對時間)
-        // e2e = 解碼完成時間 - 重建捕獲時間
-
+        // 現在 timestamp_ns 已經由 grpc_client 轉換為 client 時間參考 (os_gettime_ns)
+        // 因此: e2e = 解碼完成時間 - 捕獲時間 (都是 client 端的 os_gettime_ns)
         int64_t e2e_ms = 0;
-        if (timestamp_ns > 0 && client_perf.stream_started) {
-            auto reconstructed_capture = client_perf.stream_start + 
-                std::chrono::nanoseconds(timestamp_ns);
-            e2e_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                decode_end - reconstructed_capture).count();
-
-            // blog(LOG_INFO, "timestamp_ns: %ld",timestamp_ns);
-            // blog(LOG_INFO, "client_perf.stream_started: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(client_perf.stream_start.time_since_epoch()).count());
-            // blog(LOG_INFO, "reconstructed_capture: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(reconstructed_capture.time_since_epoch()).count());
-            // blog(LOG_INFO, "decode_end: %ld",std::chrono::duration_cast<std::chrono::milliseconds>(decode_end.time_since_epoch()).count());
+        if (timestamp_ns > 0) {
+            int64_t decode_end_ns = os_gettime_ns();
+            e2e_ms = (decode_end_ns - (int64_t)timestamp_ns) / 1000000;  // ns to ms
         }
         
         // 更新統計
@@ -416,11 +403,19 @@ static void srt_video_callback(const uint8_t* h264_data, size_t size,
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data || !data->streaming.load()) return;
     
-    // SRT 直接傳來 H.264 數據，需要解碼
+    // SRT 傳來的是相對 PTS，需要轉換為 client timestamp
+    // 1. 還原 server 捕獲時間: server_capture_time = stream_start_time + relative_pts
+    // 2. 轉換到 client 時間: client_capture_time = server_capture_time + clock_offset
+    int64_t client_timestamp_ns = pts_ns;  // fallback: 直接使用相對 PTS
+    if (data->clock_sync_valid.load() && data->stream_start_time_ns.load() > 0) {
+        int64_t server_capture_time_ns = data->stream_start_time_ns.load() + pts_ns;
+        client_timestamp_ns = server_capture_time_ns + data->clock_offset_ns.load();
+    }
+    
     // 使用 gRPC 相同的視訊回調 (codec = H264)
     grpc_video_callback(0, 0, 2,  // codec = CODEC_H264 = 2
                         h264_data, size, 0, 
-                        pts_ns,  // 已是納秒
+                        (uint64_t)client_timestamp_ns,
                         user_data);
 }
 
@@ -429,10 +424,19 @@ static void srt_audio_callback(const float* pcm_data, size_t samples,
                                 int64_t pts_ns, void* user_data) {
     remote_source_data* data = (remote_source_data*)user_data;
     if (!data || !data->streaming.load()) return;
+
+        // SRT 傳來的是相對 PTS，需要轉換為 client timestamp
+    // 1. 還原 server 捕獲時間: server_capture_time = stream_start_time + relative_pts
+    // 2. 轉換到 client 時間: client_capture_time = server_capture_time + clock_offset
+    int64_t client_timestamp_ns = pts_ns;  // fallback: 直接使用相對 PTS
+    if (data->clock_sync_valid.load() && data->stream_start_time_ns.load() > 0) {
+        int64_t server_capture_time_ns = data->stream_start_time_ns.load() + pts_ns;
+        client_timestamp_ns = server_capture_time_ns + data->clock_offset_ns.load();
+    }
     
     // 直接調用 gRPC 音訊回調
     grpc_audio_callback(sample_rate, channels, pcm_data, samples, 
-                        pts_ns,  // 已是納秒
+                        (uint64_t)client_timestamp_ns,  // 已是納秒
                         user_data);
 }
 
@@ -467,6 +471,20 @@ static void start_streaming(remote_source_data* data) {
     
     remote_source_data* capture_data = data;
     
+    // 執行時鐘同步 (RTT 測量，5 輪，排除異常值)
+    // 這會讓 grpc_client 內部存儲 clock_offset，並在 callback 時自動轉換 timestamp
+    GrpcClient::ClockSyncResult sync_result;
+    if (data->grpc_client->syncClock(sync_result)) {
+        data->clock_offset_ns = sync_result.clock_offset_ns;
+        data->clock_sync_valid = true;
+        blog(LOG_INFO, "[Remote Source] Clock sync completed: offset=%.2f ms, rtt=%.2f ms",
+             sync_result.clock_offset_ns / 1000000.0,
+             sync_result.rtt_ns / 1000000.0);
+    } else {
+        data->clock_sync_valid = false;
+        blog(LOG_WARNING, "[Remote Source] Clock sync failed, e2e timing may be inaccurate");
+    }
+    
     // 先啟動 gRPC stream（這會觸發服務器啟動 SRT）
     // 視訊和音訊: 當 SRT 連接時忽略 gRPC 數據，否則使用 gRPC
     if (!data->grpc_client->startStream(data->session_id,
@@ -482,6 +500,12 @@ static void start_streaming(remote_source_data* data) {
                 if (!capture_data->srt_client || !capture_data->srt_client->isReceiving()) {
                     grpc_audio_callback(sr, ch, d, s, t, capture_data);
                 }
+            },
+            [capture_data](int64_t stream_start_time_ns) {
+                // StreamInfo 回調: 存儲 stream start time 供 SRT 使用
+                capture_data->stream_start_time_ns = stream_start_time_ns;
+                blog(LOG_INFO, "[Remote Source] Stored stream_start_time_ns=%lld for SRT",
+                     (long long)stream_start_time_ns);
             })) {
         blog(LOG_WARNING, "[Remote Source] Failed to start gRPC stream");
         data->streaming.store(false);
@@ -566,8 +590,6 @@ static void stop_streaming(remote_source_data* data) {
     }
     
     // 重置 perf 追蹤狀態 (下次連接時重新初始化)
-    client_perf.stream_started = false;
-    client_perf.stream_start = std::chrono::steady_clock::time_point{};
     client_perf.last_recv_time = std::chrono::steady_clock::time_point{};
     
     blog(LOG_INFO, "[Remote Source] Stream stopped");
