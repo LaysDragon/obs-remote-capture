@@ -76,13 +76,9 @@ struct remote_source_data {
     std::mutex props_mutex;
     std::vector<GrpcClient::Property> cached_props;
 
-    // 視頻幀緩衝
-    std::mutex video_mutex;
-    gs_texture_t* texture;
-    uint32_t tex_width;
-    uint32_t tex_height;
-    std::vector<uint8_t> frame_buffer;
-    bool frame_ready;
+    // 視頻幀尺寸 (用於 get_width/get_height)
+    std::atomic<uint32_t> video_width{0};
+    std::atomic<uint32_t> video_height{0};
 
     // 音頻 (從服務端獲取，不是本地設定)
     bool has_audio{false};
@@ -111,11 +107,7 @@ struct remote_source_data {
         source(nullptr),
         server_port(DEFAULT_SERVER_PORT),
         connected(false),
-        streaming(false),
-        texture(nullptr),
-        tex_width(0),
-        tex_height(0),
-        frame_ready(false)
+        streaming(false)
     {}
     
     void setError(const std::string& msg) {
@@ -327,11 +319,22 @@ static void grpc_video_callback(uint32_t width, uint32_t height,
             client_perf.max_e2e_ms = 0;
         }
         
-        std::lock_guard<std::mutex> lock(data->video_mutex);
-        data->tex_width = decoded_width;
-        data->tex_height = decoded_height;
-        data->frame_buffer = std::move(decoded);
-        data->frame_ready = true;
+        // 更新尺寸供 get_width/get_height 使用
+        data->video_width.store(decoded_width);
+        data->video_height.store(decoded_height);
+        
+        // 使用 OBS async video API 輸出視訊幀
+        // 這會讓 OBS 自動根據 timestamp 同步視訊和音訊
+        struct obs_source_frame frame = {};
+        frame.width = decoded_width;
+        frame.height = decoded_height;
+        frame.format = VIDEO_FORMAT_BGRA;  // FFmpeg decoder 輸出 BGRA
+        frame.timestamp = timestamp_ns;
+        frame.data[0] = decoded.data();
+        frame.linesize[0] = decoded_width * 4;  // BGRA = 4 bytes per pixel
+        frame.full_range = true;
+        
+        obs_source_output_video(data->source, &frame);
     }
 }
 
@@ -622,11 +625,8 @@ static void remote_source_destroy(void* data_ptr) {
     stop_streaming(data);
     disconnect_and_release_session(data);
 
-    obs_enter_graphics();
-    if (data->texture) {
-        gs_texture_destroy(data->texture);
-    }
-    obs_leave_graphics();
+    // 清除 async video 輸出 (傳入 NULL 停用)
+    obs_source_output_video(data->source, nullptr);
 
     data->h264_decoder.reset();
 
@@ -711,65 +711,16 @@ static void remote_source_update(void* data_ptr, obs_data_t* settings) {
 
 static uint32_t remote_source_get_width(void* data_ptr) {
     remote_source_data* data = (remote_source_data*)data_ptr;
-    return data->tex_width;
+    return data->video_width.load();
 }
 
 static uint32_t remote_source_get_height(void* data_ptr) {
     remote_source_data* data = (remote_source_data*)data_ptr;
-    return data->tex_height;
+    return data->video_height.load();
 }
 
-static void remote_source_video_render(void* data_ptr, gs_effect_t* effect) {
-    remote_source_data* data = (remote_source_data*)data_ptr;
-
-    {
-        std::lock_guard<std::mutex> lock(data->video_mutex);
-        if (data->frame_ready && !data->frame_buffer.empty()) {
-            size_t expected_size = (size_t)data->tex_width * data->tex_height * 4;
-            if (data->frame_buffer.size() != expected_size) {
-                static uint32_t mismatch_count = 0;
-                if (++mismatch_count % 30 == 1) {
-                    blog(LOG_WARNING, "[Remote Source] Frame size mismatch");
-                }
-                data->frame_ready = false;
-                return;
-            }
-            
-            if (!data->texture ||
-                data->tex_width != gs_texture_get_width(data->texture) ||
-                data->tex_height != gs_texture_get_height(data->texture)) {
-
-                if (data->texture) {
-                    gs_texture_destroy(data->texture);
-                }
-                data->texture = gs_texture_create(
-                    data->tex_width, data->tex_height,
-                    GS_BGRA, 1, nullptr, GS_DYNAMIC);
-            }
-
-            if (data->texture) {
-                gs_texture_set_image(data->texture,
-                    data->frame_buffer.data(),
-                    data->tex_width * 4, false);
-            }
-            data->frame_ready = false;
-        }
-    }
-
-    if (data->texture) {
-        effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-        gs_technique_t* tech = gs_effect_get_technique(effect, "Draw");
-        gs_technique_begin(tech);
-        gs_technique_begin_pass(tech, 0);
-
-        gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"),
-                              data->texture);
-        gs_draw_sprite(data->texture, 0, data->tex_width, data->tex_height);
-
-        gs_technique_end_pass(tech);
-        gs_technique_end(tech);
-    }
-}
+// video_render 回調已移除 - 使用 OBS_SOURCE_ASYNC_VIDEO 模式
+// OBS 會自動根據 obs_source_output_video() 的 timestamp 渲染視訊
 
 static void remote_source_video_tick(void* data_ptr, float seconds) {
     UNUSED_PARAMETER(seconds);
@@ -1027,15 +978,18 @@ void init_remote_source_info() {
     memset(&remote_source_info, 0, sizeof(remote_source_info));
     remote_source_info.id = "remote_source";
     remote_source_info.type = OBS_SOURCE_TYPE_INPUT;
-    remote_source_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO |
+    // OBS_SOURCE_ASYNC_VIDEO: 使用 obs_source_output_video() 輸出視訊
+    // OBS 會自動根據 timestamp 同步音視訊
+    remote_source_info.output_flags = OBS_SOURCE_AUDIO |
                                       OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE;
     remote_source_info.get_name = remote_source_get_name;
     remote_source_info.create = remote_source_create;
     remote_source_info.destroy = remote_source_destroy;
     remote_source_info.update = remote_source_update;
+    // async video source 不需要 video_render，OBS 會自動處理
+    // get_width/get_height 對 async source 也是可選的，但保留以供 UI 顯示
     remote_source_info.get_width = remote_source_get_width;
     remote_source_info.get_height = remote_source_get_height;
-    remote_source_info.video_render = remote_source_video_render;
     remote_source_info.video_tick = remote_source_video_tick;
     remote_source_info.get_properties = remote_source_properties;
     remote_source_info.get_defaults = remote_source_get_defaults;
