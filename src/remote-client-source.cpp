@@ -805,66 +805,61 @@ static void remote_source_video_tick(void* data_ptr, float seconds) {
     }
 }
 
-// ========== 屬性面板 ==========
-static bool on_refresh_clicked(obs_properties_t* props, obs_property_t* p,
-                               void* data_ptr) {
-    UNUSED_PARAMETER(p);
-    remote_source_data* data = (remote_source_data*)data_ptr;
-    if (!data || !data->source) return false;
-    
-    // 從 source 讀取當前設定 (重要：按鈕回調沒有 settings 參數)
-    obs_data_t* settings = obs_source_get_settings(data->source);
-    if (settings) {
-        std::string new_ip = obs_data_get_string(settings, "server_ip");
-        int new_port = (int)obs_data_get_int(settings, "server_port");
-        if (new_port <= 0) new_port = DEFAULT_SERVER_PORT;
-        
-        // 如果 IP/Port 改變，斷開舊連接
-        if (new_ip != data->server_ip || new_port != data->server_port) {
-            if (data->connected.load()) {
-                disconnect_and_release_session(data);
-            }
-            data->server_ip = new_ip;
-            data->server_port = new_port;
+// ========== 屬性面板 Helper 函數 ==========
+// 移除所有 child_ 開頭的屬性
+static void remove_child_properties(obs_properties_t* props) {
+    std::vector<std::string> to_remove;
+    obs_property_t* prop = obs_properties_first(props);
+    while (prop) {
+        const char* name = obs_property_name(prop);
+        if (strncmp(name, "child_", 6) == 0) {
+            to_remove.push_back(name);
         }
-        obs_data_release(settings);
+        obs_property_next(&prop);
     }
-    
-    // 嘗試連接
-    if (!data->connected.load()) {
-        connect_and_create_session(data);
+    for (const auto& name : to_remove) {
+        obs_properties_remove_by_name(props, name.c_str());
     }
-    
-    // 更新錯誤訊息顯示
-    obs_property_t* error_prop = obs_properties_get(props, "error_message");
-    if (error_prop) {
-        std::string err = data->getError();
-        if (!err.empty()) {
-            obs_property_set_description(error_prop, ("⚠️ " + err).c_str());
-            obs_property_set_visible(error_prop, true);
-        } else if (data->connected.load()) {
-            obs_property_set_description(error_prop, "✅ Connected");
-            obs_property_set_visible(error_prop, true);
-        } else {
-            obs_property_set_visible(error_prop, false);
-        }
-    }
-    
-    if (!data->connected.load()) return true;  // 返回 true 以刷新 UI
-    
-    // 更新 source type 列表
-    obs_property_t* source_list = obs_properties_get(props, "source_type");
-    if (source_list) {
-        obs_property_list_clear(source_list);
-        
-        for (const auto& src : data->available_sources) {
-            obs_property_list_add_string(source_list, src.display_name.c_str(), src.id.c_str());
-        }
-    }
-    
-    return true;
 }
 
+// 從 cached_props 添加 child_ 屬性到 props（需在 props_mutex 鎖內調用或已持有鎖）
+static void add_child_properties_from_cache(obs_properties_t* props, 
+                                            const std::vector<GrpcClient::Property>& cached_props) {
+    for (const auto& cprop : cached_props) {
+        std::string child_name = "child_" + cprop.name;
+        
+        switch (cprop.type) {
+        case OBS_PROPERTY_LIST: {
+            obs_property_t* list = obs_properties_add_list(props,
+                child_name.c_str(), cprop.description.c_str(),
+                OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+            for (const auto& item : cprop.items) {
+                obs_property_list_add_string(list, item.name.c_str(), item.value.c_str());
+            }
+            break;
+        }
+        case OBS_PROPERTY_BOOL:
+            obs_properties_add_bool(props, child_name.c_str(), cprop.description.c_str());
+            break;
+        case OBS_PROPERTY_INT:
+            obs_properties_add_int(props, child_name.c_str(), cprop.description.c_str(),
+                cprop.min_int, cprop.max_int, cprop.step_int);
+            break;
+        case OBS_PROPERTY_FLOAT:
+            obs_properties_add_float(props, child_name.c_str(), cprop.description.c_str(),
+                cprop.min_float, cprop.max_float, cprop.step_float);
+            break;
+        case OBS_PROPERTY_TEXT:
+            obs_properties_add_text(props, child_name.c_str(), cprop.description.c_str(),
+                OBS_TEXT_DEFAULT);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+// ========== 屬性面板 ==========
 static bool on_source_type_changed(obs_properties_t* props, obs_property_t* p,
                                     obs_data_t* settings) {
     UNUSED_PARAMETER(p);
@@ -894,55 +889,11 @@ static bool on_source_type_changed(obs_properties_t* props, obs_property_t* p,
         data->cached_props = std::move(new_props);
     }
     
-    // 移除舊的 child_ 屬性
-    std::vector<std::string> to_remove;
-    obs_property_t* prop = obs_properties_first(props);
-    while (prop) {
-        const char* name = obs_property_name(prop);
-        if (strncmp(name, "child_", 6) == 0) {
-            to_remove.push_back(name);
-        }
-        obs_property_next(&prop);
-    }
-    for (const auto& name : to_remove) {
-        obs_properties_remove_by_name(props, name.c_str());
-    }
-    
-    // 添加新的 child_ 屬性
+    // 移除舊的 child_ 屬性並添加新的
+    remove_child_properties(props);
     {
         std::lock_guard<std::mutex> lock(data->props_mutex);
-        for (const auto& cprop : data->cached_props) {
-            std::string child_name = "child_" + cprop.name;
-            
-            switch (cprop.type) {
-            case OBS_PROPERTY_LIST: {
-                obs_property_t* list = obs_properties_add_list(props,
-                    child_name.c_str(), cprop.description.c_str(),
-                    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-                for (const auto& item : cprop.items) {
-                    obs_property_list_add_string(list, item.name.c_str(), item.value.c_str());
-                }
-                break;
-            }
-            case OBS_PROPERTY_BOOL:
-                obs_properties_add_bool(props, child_name.c_str(), cprop.description.c_str());
-                break;
-            case OBS_PROPERTY_INT:
-                obs_properties_add_int(props, child_name.c_str(), cprop.description.c_str(),
-                    cprop.min_int, cprop.max_int, cprop.step_int);
-                break;
-            case OBS_PROPERTY_FLOAT:
-                obs_properties_add_float(props, child_name.c_str(), cprop.description.c_str(),
-                    cprop.min_float, cprop.max_float, cprop.step_float);
-                break;
-            case OBS_PROPERTY_TEXT:
-                obs_properties_add_text(props, child_name.c_str(), cprop.description.c_str(),
-                    OBS_TEXT_DEFAULT);
-                break;
-            default:
-                break;
-            }
-        }
+        add_child_properties_from_cache(props, data->cached_props);
     }
     
     return true;
@@ -959,10 +910,6 @@ static obs_properties_t* remote_source_properties(void* data_ptr) {
         "伺服器 IP (Server IP)", OBS_TEXT_DEFAULT);
     obs_properties_add_int(props, "server_port",
         "端口 (Port)", 1, 65535, 1);
-
-    // 刷新按鈕 (暫時註解，因為 settings 變更已自動觸發 update)
-    // obs_properties_add_button(props, "refresh",
-    //     "連接/刷新 (Connect/Refresh)", on_refresh_clicked);
 
     // 錯誤/狀態訊息顯示
     obs_property_t* error_prop = obs_properties_add_text(props, "error_message",
@@ -997,38 +944,7 @@ static obs_properties_t* remote_source_properties(void* data_ptr) {
     // 動態添加 child_ 屬性 (如果已有緩存)
     if (data) {
         std::lock_guard<std::mutex> lock(data->props_mutex);
-        for (const auto& cprop : data->cached_props) {
-            std::string child_name = "child_" + cprop.name;
-            
-            switch (cprop.type) {
-            case OBS_PROPERTY_LIST: {
-                obs_property_t* list = obs_properties_add_list(props,
-                    child_name.c_str(), cprop.description.c_str(),
-                    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-                for (const auto& item : cprop.items) {
-                    obs_property_list_add_string(list, item.name.c_str(), item.value.c_str());
-                }
-                break;
-            }
-            case OBS_PROPERTY_BOOL:
-                obs_properties_add_bool(props, child_name.c_str(), cprop.description.c_str());
-                break;
-            case OBS_PROPERTY_INT:
-                obs_properties_add_int(props, child_name.c_str(), cprop.description.c_str(),
-                    cprop.min_int, cprop.max_int, cprop.step_int);
-                break;
-            case OBS_PROPERTY_FLOAT:
-                obs_properties_add_float(props, child_name.c_str(), cprop.description.c_str(),
-                    cprop.min_float, cprop.max_float, cprop.step_float);
-                break;
-            case OBS_PROPERTY_TEXT:
-                obs_properties_add_text(props, child_name.c_str(), cprop.description.c_str(),
-                    OBS_TEXT_DEFAULT);
-                break;
-            default:
-                break;
-            }
-        }
+        add_child_properties_from_cache(props, data->cached_props);
     }
 
     // 音頻捕捉
